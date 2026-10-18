@@ -4,9 +4,12 @@ use std::{
 };
 
 use smithay::{
-    reexports::calloop::timer::{TimeoutAction, Timer},
+    reexports::{
+        calloop::timer::{TimeoutAction, Timer},
+        input::ScrollMethod,
+    },
     backend::input::{
-        AbsolutePositionEvent, Axis, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
+        AbsolutePositionEvent, Axis, AxisSource, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
         PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, ButtonState,
     },
     input::{
@@ -18,7 +21,7 @@ use smithay::{
 
 use crate::{
     handlers::surface_at,
-    shell::{self, Entry, Page},
+    shell::{self, Entry, Page, PowerAction},
     state::State,
 };
 
@@ -29,7 +32,8 @@ impl State {
             pos.x.clamp(0.0, (size.w.saturating_sub(1).max(0)) as f64),
             pos.y.clamp(0.0, (size.h.saturating_sub(1).max(0)) as f64),
         ));
-        let expanded = pos.x < f64::from(shell::strip_width(self.strip_expanded));
+        let over_strip = pos.x < f64::from(shell::strip_width(self.strip_expanded));
+        let expanded = self.power_menu || over_strip;
         self.pointer = pos;
         self.strip_expanded = expanded;
         self.point_pointer();
@@ -67,20 +71,26 @@ impl State {
                 event.time() as u32,
             ),
             InputEvent::PointerAxis { event } => {
-                if self.strip_grab || shell::hit_strip(self.strip_expanded, self.pointer.x, self.pointer.y).is_some()
+                if self.strip_grab || shell::hit_strip(self.strip_expanded, self.output_size.h, self.pointer.x, self.pointer.y).is_some()
                 {
                     return;
                 }
                 self.point_pointer();
-                let mut frame = AxisFrame::new(event.time() as u32).source(event.source());
+                let source = event.source();
+                let contact = matches!(source, AxisSource::Finger | AxisSource::Continuous);
+                let mut frame = AxisFrame::new(event.time_msec()).source(source);
                 for axis in [Axis::Horizontal, Axis::Vertical] {
-                    if let Some(amount) = event.amount(axis) {
-                        if amount != 0.0 {
-                            frame = frame.value(axis, amount);
-                        }
+                    frame = frame.relative_direction(axis, event.relative_direction(axis));
+                    match scroll_step(contact, event.amount(axis)) {
+                        ScrollStep::Move(amount) => frame = frame.value(axis, amount),
+                        ScrollStep::Stop => frame = frame.stop(axis),
+                        ScrollStep::Skip => {}
                     }
                     if let Some(discrete) = event.amount_v120(axis) {
-                        frame = frame.v120(axis, discrete as i32);
+                        let steps = discrete as i32;
+                        if steps != 0 {
+                            frame = frame.v120(axis, steps);
+                        }
                     }
                 }
                 self.seat.get_pointer().unwrap().axis(self, frame);
@@ -92,12 +102,22 @@ impl State {
 
     fn pointer_button(&mut self, button: u32, state: ButtonState, time: u32) {
         let serial = SERIAL_COUNTER.next_serial();
-        let on_strip = shell::hit_strip(self.strip_expanded, self.pointer.x, self.pointer.y);
+        let on_strip = shell::hit_strip(self.strip_expanded, self.output_size.h, self.pointer.x, self.pointer.y);
         if state == ButtonState::Pressed {
             if let Some(entry) = on_strip {
                 self.strip_grab = true;
                 self.activate(entry);
                 return;
+            }
+            if self.power_menu {
+                if let Some(action) = shell::hit_power_action(self.output_size.h, self.pointer.x, self.pointer.y) {
+                    self.strip_grab = true;
+                    self.run_power(action);
+                    return;
+                }
+                self.power_menu = false;
+                self.strip_expanded = self.pointer.x < f64::from(shell::STRIP_COLLAPSED);
+                self.mark_dirty();
             }
             self.strip_grab = false;
             if self.page == Page::Browser {
@@ -134,7 +154,7 @@ impl State {
 
     fn point_pointer(&mut self) {
         let serial = SERIAL_COUNTER.next_serial();
-        let under = if shell::hit_strip(self.strip_expanded, self.pointer.x, self.pointer.y).is_some() {
+        let under = if shell::hit_strip(self.strip_expanded, self.output_size.h, self.pointer.x, self.pointer.y).is_some() {
             None
         } else {
             surface_at(self, self.pointer)
@@ -154,8 +174,13 @@ impl State {
 
     fn activate(&mut self, entry: Entry) {
         match entry {
-            Entry::Start => self.page = Page::Start,
+            Entry::Start => {
+                self.page = Page::Start;
+                self.power_menu = false;
+            }
+            Entry::Power => self.power_menu = !self.power_menu,
             Entry::Browser => {
+                self.power_menu = false;
                 self.page = Page::Browser;
                 if self.space.elements().next().is_none() {
                     self.launch_browser();
@@ -195,6 +220,19 @@ impl State {
         }
     }
 
+    fn run_power(&mut self, action: PowerAction) {
+        self.power_menu = false;
+        self.mark_dirty();
+        match action {
+            PowerAction::Logout => {
+                tracing::info!("log out");
+                std::process::exit(0);
+            }
+            PowerAction::Shutdown => request_session("poweroff"),
+            PowerAction::Reboot => request_session("reboot"),
+        }
+    }
+
     fn arm_startup_feedback(&mut self) {
         if self.startup_timer {
             return;
@@ -221,5 +259,66 @@ impl State {
         {
             self.startup_timer = false;
         }
+    }
+}
+
+fn request_session(verb: &str) {
+    match Command::new("loginctl").arg(verb).status() {
+        Ok(status) if status.success() => tracing::info!(verb, "asked logind"),
+        Ok(status) => tracing::error!(verb, ?status, "logind refused"),
+        Err(err) => tracing::error!(verb, ?err, "loginctl failed"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ScrollStep {
+    Move(f64),
+    Stop,
+    Skip,
+}
+
+/// A finger or continuous scroll ends with a zero value. That zero is the stop,
+/// not an empty frame. A wheel has no such terminator.
+pub(crate) fn scroll_step(contact: bool, amount: Option<f64>) -> ScrollStep {
+    match amount {
+        Some(0.0) if contact => ScrollStep::Stop,
+        Some(0.0) => ScrollStep::Skip,
+        Some(amount) => ScrollStep::Move(amount),
+        None => ScrollStep::Skip,
+    }
+}
+
+/// libinput allows one scroll emulation at a time. Two fingers when the pad
+/// reports them, otherwise a drag along the right or bottom edge.
+pub(crate) fn preferred_scroll(methods: &[ScrollMethod]) -> Option<ScrollMethod> {
+    if methods.contains(&ScrollMethod::TwoFinger) {
+        Some(ScrollMethod::TwoFinger)
+    } else if methods.contains(&ScrollMethod::Edge) {
+        Some(ScrollMethod::Edge)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finger_scroll_ends_with_a_stop() {
+        assert_eq!(scroll_step(true, Some(12.0)), ScrollStep::Move(12.0));
+        assert_eq!(scroll_step(true, Some(0.0)), ScrollStep::Stop);
+        assert_eq!(scroll_step(false, Some(0.0)), ScrollStep::Skip);
+        assert_eq!(scroll_step(true, None), ScrollStep::Skip);
+    }
+
+    #[test]
+    fn edge_scroll_is_the_fallback() {
+        assert_eq!(
+            preferred_scroll(&[ScrollMethod::TwoFinger, ScrollMethod::Edge]),
+            Some(ScrollMethod::TwoFinger)
+        );
+        assert_eq!(preferred_scroll(&[ScrollMethod::Edge]), Some(ScrollMethod::Edge));
+        assert_eq!(preferred_scroll(&[ScrollMethod::NoScroll]), None);
     }
 }

@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use smithay::{
+    reexports::input::Device as InputDevice,
     backend::{
         allocator::Fourcc,
         drm::{DrmDevice, DrmDeviceFd, DrmEvent},
@@ -55,7 +56,8 @@ pub struct Gpu {
     pub damage: OutputDamageTracker,
     pub background: MemoryRenderBuffer,
     pub strip: MemoryRenderBuffer,
-    pub strip_key: (bool, Page, i32, i32),
+    pub strip_key: (bool, Page, bool, i32, i32),
+    pub power_menu: MemoryRenderBuffer,
     pub cursor: MemoryRenderBuffer,
     pub cursor_hot: (i32, i32),
     pub crtc: crtc::Handle,
@@ -148,7 +150,12 @@ fn open_gpu(
     let libinput_saved = libinput.clone();
     handle
         .insert_source(LibinputInputBackend::new(libinput), |event, _, state| {
-            state.on_input(event);
+            match event {
+                smithay::backend::input::InputEvent::DeviceAdded { mut device } => {
+                    configure_pointer_scroll(&mut device);
+                }
+                other => state.on_input(other),
+            }
         })
         .map_err(|err| err.to_string())?;
 
@@ -216,7 +223,7 @@ fn open_gpu(
     let buffers = alloc_scan_buffers(&fd, (u32::from(width), u32::from(height)))?;
     let damage = OutputDamageTracker::from_output(&output);
     let background = background_buffer(state.output_size.w, state.output_size.h);
-    let strip = strip_buffer(state.output_size.h, false, Page::Start);
+    let strip = strip_buffer(state.output_size.h, false, Page::Start, false);
     let (cursor, cursor_hot) = cursor_buffer();
     Ok(Gpu {
         renderer,
@@ -226,7 +233,8 @@ fn open_gpu(
         damage,
         background,
         strip,
-        strip_key: (false, Page::Start, state.output_size.w, state.output_size.h),
+        strip_key: (false, Page::Start, false, state.output_size.w, state.output_size.h),
+        power_menu: power_menu_buffer(),
         cursor,
         cursor_hot,
         crtc: picked.crtc,
@@ -323,15 +331,16 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
     let startup = if windows.is_empty() {
         state
             .browser_starting
-            .map(|started| shell::startup_fraction(started.elapsed().as_millis()))
+            .map(|started| shell::startup_phase(started.elapsed().as_millis()))
     } else {
         None
     };
+    let power_menu = state.power_menu;
 
     let gpu = state.gpu.as_mut().ok_or("no gpu")?;
-    if gpu.strip_key != (expanded, page, size.w, size.h) {
-        gpu.strip = strip_buffer(size.h, expanded, page);
-        gpu.strip_key = (expanded, page, size.w, size.h);
+    if gpu.strip_key != (expanded, page, power_menu, size.w, size.h) {
+        gpu.strip = strip_buffer(size.h, expanded, page, power_menu);
+        gpu.strip_key = (expanded, page, power_menu, size.w, size.h);
     }
 
     let mut elements: Vec<ShellElement<PixmanRenderer>> = Vec::new();
@@ -363,8 +372,23 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         )
         .map_err(|err| err.to_string())?,
     ));
-    if let Some(fraction) = startup {
-        let pixels = shell::paint_startup_bar(fraction);
+    if power_menu {
+        let (x, y) = shell::power_menu_origin(size.h);
+        elements.push(ShellElement::Memory(
+            MemoryRenderBufferRenderElement::from_buffer(
+                &mut gpu.renderer,
+                (f64::from(x), f64::from(y)),
+                &gpu.power_menu,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            )
+            .map_err(|err| err.to_string())?,
+        ));
+    }
+    if let Some(phase) = startup {
+        let pixels = shell::paint_startup_bar(phase);
         let bar = MemoryRenderBuffer::from_slice(
             &pixels,
             Fourcc::Argb8888,
@@ -415,7 +439,7 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         .map_err(|err| err.to_string())?,
     ));
 
-    // Front to back: cursor, strip, startup bar, window, then the gradient.
+    // Front to back: cursor, strip, power menu, startup bar, window, then the gradient.
     let index = gpu.displayed.map(|shown| (shown + 1) % gpu.buffers.len()).unwrap_or(0);
     paint_scanout(gpu, index, &elements)?;
     present(gpu, index)
@@ -523,9 +547,35 @@ fn cursor_buffer() -> (MemoryRenderBuffer, (i32, i32)) {
     (buffer, (cursor.hot_x, cursor.hot_y))
 }
 
-fn strip_buffer(height: i32, expanded: bool, page: Page) -> MemoryRenderBuffer {
+fn power_menu_buffer() -> MemoryRenderBuffer {
+    let pixels = shell::paint_power_menu();
+    MemoryRenderBuffer::from_slice(
+        &pixels,
+        Fourcc::Argb8888,
+        (shell::MENU_W, shell::MENU_H),
+        1,
+        Transform::Normal,
+        None,
+    )
+}
+
+fn configure_pointer_scroll(device: &mut InputDevice) {
+    let methods = device.config_scroll_methods();
+    let Some(chosen) = crate::input::preferred_scroll(&methods) else {
+        return;
+    };
+    if device.config_scroll_method() != Some(chosen) {
+        if let Err(err) = device.config_scroll_set_method(chosen) {
+            tracing::warn!(name = device.name(), ?err, "scroll method");
+            return;
+        }
+    }
+    tracing::info!(name = device.name(), ?chosen, ?methods, "scroll method");
+}
+
+fn strip_buffer(height: i32, expanded: bool, page: Page, power_open: bool) -> MemoryRenderBuffer {
     let width = shell::strip_width(expanded);
-    let pixels = shell::paint_strip(width, height, expanded, page);
+    let pixels = shell::paint_strip(width, height, expanded, page, power_open);
     MemoryRenderBuffer::from_slice(
         &pixels,
         Fourcc::Xrgb8888,

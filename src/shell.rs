@@ -14,6 +14,14 @@ pub enum Page {
 pub enum Entry {
     Start,
     Browser,
+    Power,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerAction {
+    Logout,
+    Shutdown,
+    Reboot,
 }
 
 pub fn strip_width(expanded: bool) -> i32 {
@@ -35,21 +43,53 @@ pub fn content_size(output_w: i32, output_h: i32) -> (i32, i32) {
 
 pub const BAR_W: i32 = 180;
 pub const BAR_H: i32 = 32;
+pub const MENU_W: i32 = 168;
+pub const MENU_H: i32 = 136;
+const BTN_H: i32 = 40;
+const BTN_GAP: i32 = 8;
 
-/// Approaches nine tenths and stops there until the browser window exists.
-pub fn startup_fraction(elapsed_ms: u128) -> f32 {
-    let seconds = elapsed_ms as f32 / 1000.0;
-    (1.0 - (-seconds / 5.0).exp()) * 0.9
+/// Firefox does not report startup progress, so the mark loops instead of filling.
+pub fn startup_phase(elapsed_ms: u128) -> f32 {
+    (elapsed_ms % 1_400) as f32 / 1_400.0
 }
 
-pub fn hit_strip(expanded: bool, x: f64, y: f64) -> Option<Entry> {
-    if x < 0.0 || y < 0.0 || x >= f64::from(strip_width(expanded)) {
+pub fn hit_strip(expanded: bool, height: i32, x: f64, y: f64) -> Option<Entry> {
+    if x < 0.0 || y < 0.0 || x >= f64::from(strip_width(expanded)) || y >= f64::from(height.max(0)) {
         return None;
+    }
+    if y >= f64::from(height - ROW) {
+        return Some(Entry::Power);
     }
     let row = (y / f64::from(ROW)) as i32;
     match row {
         0 => Some(Entry::Start),
         1 => Some(Entry::Browser),
+        _ => None,
+    }
+}
+
+/// Sits just to the right of the expanded strip, beside the power icon.
+pub fn power_menu_origin(output_h: i32) -> (i32, i32) {
+    (STRIP_EXPANDED + 12, (output_h - 16 - MENU_H).max(0))
+}
+
+pub fn hit_power_action(output_h: i32, x: f64, y: f64) -> Option<PowerAction> {
+    let (origin_x, origin_y) = power_menu_origin(output_h);
+    let local_x = x - f64::from(origin_x);
+    let local_y = y - f64::from(origin_y);
+    if local_x < 0.0 || local_y < 0.0 || local_x >= f64::from(MENU_W) || local_y >= f64::from(MENU_H) {
+        return None;
+    }
+    let stride = f64::from(BTN_H + BTN_GAP);
+    let row = (local_y / stride) as i32;
+    let within = local_y - f64::from(row) * stride;
+    if within < 0.0 || within >= f64::from(BTN_H) {
+        return None;
+    }
+    match row {
+        0 => Some(PowerAction::Logout),
+        1 => Some(PowerAction::Shutdown),
+        2 => Some(PowerAction::Reboot),
         _ => None,
     }
 }
@@ -76,7 +116,7 @@ pub fn paint_gradient(buf: &mut [u8], width: i32, height: i32) {
     }
 }
 
-pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page) -> Vec<u8> {
+pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page, power_open: bool) -> Vec<u8> {
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
@@ -85,26 +125,39 @@ pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page) -> Vec<u
     }
     for (index, entry) in [Entry::Start, Entry::Browser].into_iter().enumerate() {
         let row_y = index as i32 * ROW;
-        if row_y >= height {
+        if row_y + ROW > height - ROW {
             break;
         }
         let active = match (page, entry) {
             (Page::Start, Entry::Start) | (Page::Browser, Entry::Browser) => true,
             _ => false,
         };
-        if active {
-            fill_rect(&mut pixels, width, height, 0, row_y, 3, ROW, 215, 196, 163);
-        }
-        paint_entry_icon(&mut pixels, width, height, 10, row_y + 10, entry);
-        if expanded {
-            let label = match entry {
-                Entry::Start => "Start",
-                Entry::Browser => "Browser",
-            };
-            draw_text(&mut pixels, width, height, 48, row_y + 16, label);
-        }
+        paint_row(&mut pixels, width, height, row_y, expanded, active, entry);
+    }
+    if height >= ROW {
+        paint_row(&mut pixels, width, height, height - ROW, expanded, power_open, Entry::Power);
     }
     pixels
+}
+
+fn paint_row(buf: &mut [u8], width: i32, height: i32, row_y: i32, expanded: bool, active: bool, entry: Entry) {
+    if active {
+        fill_rect(buf, width, height, 0, row_y, 3, ROW, 215, 196, 163);
+    }
+    let icon = match entry {
+        Entry::Start => image(include_bytes!("../assets/start.bgra")),
+        Entry::Browser => image(include_bytes!("../assets/browser.bgra")),
+        Entry::Power => image(include_bytes!("../assets/power.bgra")),
+    };
+    blit(buf, width, height, 8, row_y + 8, &icon);
+    if expanded {
+        let label = match entry {
+            Entry::Start => "Start",
+            Entry::Browser => "Browser",
+            Entry::Power => "Power",
+        };
+        draw_text(buf, width, height, 48, row_y + 20, label);
+    }
 }
 
 fn draw_text(buf: &mut [u8], width: i32, height: i32, x: i32, y: i32, text: &str) {
@@ -128,7 +181,13 @@ fn draw_text(buf: &mut [u8], width: i32, height: i32, x: i32, y: i32, text: &str
 fn glyph(ch: char) -> [u8; 7] {
     match ch {
         'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
         'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'd' => [0b00001, 0b00001, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111],
+        'h' => [0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001],
+        'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10001, 0b01111],
         'g' => [0b00000, 0b00000, 0b01110, 0b10000, 0b10011, 0b10001, 0b01110],
         'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
         'n' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
@@ -190,134 +249,103 @@ pub struct CursorImage {
     pub hot_y: i32,
 }
 
-/// Arrow with a dark outline and a light fill. The tip is the hotspot.
 pub fn paint_cursor() -> CursorImage {
-    const ROWS: [&str; 21] = [
-        "#",
-        "##",
-        "#.#",
-        "#..#",
-        "#...#",
-        "#....#",
-        "#.....#",
-        "#......#",
-        "#.......#",
-        "#........#",
-        "#......####",
-        "#...#..#",
-        "#..#..#",
-        "#.#..#",
-        "##..#",
-        "#..#",
-        " ..#",
-        "  ..#",
-        "   ..#",
-        "    ..#",
-        "     ##",
-    ];
-    let height = ROWS.len() as i32;
-    let width = ROWS.iter().map(|row| row.len()).max().unwrap_or(1) as i32;
-    let mut pixels = vec![0u8; (width * height * 4) as usize];
-    for (y, row) in ROWS.iter().enumerate() {
-        for (x, ch) in row.chars().enumerate() {
-            match ch {
-                '#' => put(&mut pixels, width, x as i32, y as i32, 20, 20, 22),
-                '.' => put(&mut pixels, width, x as i32, y as i32, 245, 244, 236),
-                _ => {}
-            }
-        }
-    }
+    let cursor = image(include_bytes!("../assets/cursor.bgra"));
     CursorImage {
-        pixels,
-        width,
-        height,
-        hot_x: 0,
-        hot_y: 0,
+        pixels: cursor.pixels.to_vec(),
+        width: cursor.width,
+        height: cursor.height,
+        hot_x: cursor.hot_x,
+        hot_y: cursor.hot_y,
     }
 }
 
-pub fn paint_startup_bar(fraction: f32) -> Vec<u8> {
-    let fraction = fraction.clamp(0.0, 1.0);
+pub fn paint_startup_bar(phase: f32) -> Vec<u8> {
+    let phase = phase.clamp(0.0, 1.0);
     let mut pixels = vec![0u8; (BAR_W * BAR_H * 4) as usize];
     fill_rect(&mut pixels, BAR_W, BAR_H, 0, 0, BAR_W, BAR_H, 22, 24, 29);
     let label = "Starting";
     let text_w = label.len() as i32 * 6;
     draw_text(&mut pixels, BAR_W, BAR_H, (BAR_W - text_w) / 2, 4, label);
     let track_y = 20;
-    fill_rect(&mut pixels, BAR_W, BAR_H, 8, track_y, BAR_W - 16, 6, 12, 13, 16);
-    let fill = ((BAR_W - 16) as f32 * fraction).round() as i32;
-    if fill > 0 {
-        fill_rect(&mut pixels, BAR_W, BAR_H, 8, track_y, fill, 6, 215, 196, 163);
+    let track_w = BAR_W - 16;
+    fill_rect(&mut pixels, BAR_W, BAR_H, 8, track_y, track_w, 6, 12, 13, 16);
+    let segment = track_w / 3;
+    let travel = (track_w - segment).max(0);
+    let x = 8 + (travel as f32 * phase).round() as i32;
+    fill_rect(&mut pixels, BAR_W, BAR_H, x, track_y, segment, 6, 215, 196, 163);
+    pixels
+}
+
+pub fn paint_power_menu() -> Vec<u8> {
+    let mut pixels = vec![0u8; (MENU_W * MENU_H * 4) as usize];
+    fill_rect(&mut pixels, MENU_W, MENU_H, 0, 0, MENU_W, MENU_H, 22, 24, 29);
+    let actions = [
+        (PowerAction::Logout, "Log out", include_bytes!("../assets/logout.bgra") as &[u8]),
+        (PowerAction::Shutdown, "Shut down", include_bytes!("../assets/shutdown.bgra")),
+        (PowerAction::Reboot, "Restart", include_bytes!("../assets/reboot.bgra")),
+    ];
+    for (index, (_, label, bytes)) in actions.into_iter().enumerate() {
+        let y = index as i32 * (BTN_H + BTN_GAP);
+        fill_rect(&mut pixels, MENU_W, MENU_H, 0, y, MENU_W, BTN_H, 42, 45, 54);
+        let icon = image(bytes);
+        blit(&mut pixels, MENU_W, MENU_H, 10, y + (BTN_H - icon.height) / 2, &icon);
+        draw_text(&mut pixels, MENU_W, MENU_H, 42, y + 16, label);
     }
     pixels
 }
 
-fn paint_entry_icon(buf: &mut [u8], width: i32, height: i32, x: i32, y: i32, entry: Entry) {
-    let plate = match entry {
-        Entry::Start => (58, 48, 36),
-        Entry::Browser => (36, 48, 60),
-    };
-    let mark = match entry {
-        Entry::Start => (236, 220, 176),
-        Entry::Browser => (232, 236, 240),
-    };
-    rounded_rect(buf, width, height, x, y, 28, 28, 6, plate.0, plate.1, plate.2);
-    match entry {
-        Entry::Start => star(buf, width, height, x + 14, y + 14, mark.0, mark.1, mark.2),
-        Entry::Browser => globe(buf, width, height, x + 14, y + 14, mark.0, mark.1, mark.2),
+struct Image {
+    width: i32,
+    height: i32,
+    hot_x: i32,
+    hot_y: i32,
+    pixels: &'static [u8],
+}
+
+fn image(bytes: &'static [u8]) -> Image {
+    let width = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let height = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let hot_x = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let hot_y = i32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let pixels = &bytes[16..];
+    Image {
+        width,
+        height,
+        hot_x,
+        hot_y,
+        pixels,
     }
 }
 
-fn rounded_rect(buf: &mut [u8], width: i32, _height: i32, x: i32, y: i32, w: i32, h: i32, radius: i32, r: u8, g: u8, b: u8) {
-    for dy in 0..h {
-        for dx in 0..w {
-            if inside_round(dx, dy, w, h, radius) {
-                put(buf, width, x + dx, y + dy, r, g, b);
+fn blit(buf: &mut [u8], width: i32, height: i32, x: i32, y: i32, src: &Image) {
+    for sy in 0..src.height {
+        for sx in 0..src.width {
+            let si = ((sy * src.width + sx) * 4) as usize;
+            let alpha = src.pixels[si + 3];
+            if alpha == 0 {
+                continue;
             }
-        }
-    }
-}
-
-fn inside_round(dx: i32, dy: i32, w: i32, h: i32, radius: i32) -> bool {
-    let (cx, cy) = if dx < radius && dy < radius {
-        (radius - 1, radius - 1)
-    } else if dx >= w - radius && dy < radius {
-        (w - radius, radius - 1)
-    } else if dx < radius && dy >= h - radius {
-        (radius - 1, h - radius)
-    } else if dx >= w - radius && dy >= h - radius {
-        (w - radius, h - radius)
-    } else {
-        return true;
-    };
-    let ox = dx - cx;
-    let oy = dy - cy;
-    ox * ox + oy * oy <= radius * radius
-}
-
-fn star(buf: &mut [u8], width: i32, _height: i32, cx: i32, cy: i32, r: u8, g: u8, b: u8) {
-    for dy in -9..=9i32 {
-        for dx in -9..=9i32 {
-            let ax = dx.abs();
-            let ay = dy.abs();
-            let arm = (ay <= 1 && ax <= 8) || (ax <= 1 && ay <= 8) || (ax + ay <= 5);
-            if arm {
-                put(buf, width, cx + dx, cy + dy, r, g, b);
+            let dx = x + sx;
+            let dy = y + sy;
+            if dx < 0 || dy < 0 || dx >= width || dy >= height {
+                continue;
             }
-        }
-    }
-}
-
-fn globe(buf: &mut [u8], width: i32, _height: i32, cx: i32, cy: i32, r: u8, g: u8, b: u8) {
-    for dy in -8..=8i32 {
-        for dx in -8..=8i32 {
-            let d2 = dx * dx + dy * dy;
-            let ring = (36..=64).contains(&d2);
-            let equator = dy.abs() <= 1 && d2 <= 64;
-            let meridian = dx.abs() <= 1 && d2 <= 64;
-            if ring || equator || meridian {
-                put(buf, width, cx + dx, cy + dy, r, g, b);
+            let di = ((dy * width + dx) * 4) as usize;
+            if di + 3 >= buf.len() {
+                continue;
             }
+            if alpha == 255 {
+                buf[di..di + 4].copy_from_slice(&src.pixels[si..si + 4]);
+                continue;
+            }
+            let inv = u16::from(255 - alpha);
+            let cover = u16::from(alpha);
+            for channel in 0..3 {
+                let mixed = u16::from(src.pixels[si + channel]) * cover + u16::from(buf[di + channel]) * inv;
+                buf[di + channel] = (mixed / 255) as u8;
+            }
+            buf[di + 3] = 255;
         }
     }
 }
@@ -344,15 +372,32 @@ mod tests {
 
     #[test]
     fn collapsed_strip_ignores_clicks_past_the_icons() {
-        assert_eq!(hit_strip(false, 10.0, 10.0), Some(Entry::Start));
-        assert_eq!(hit_strip(false, 10.0, 60.0), Some(Entry::Browser));
-        assert_eq!(hit_strip(false, 49.0, 10.0), None);
-        assert_eq!(hit_strip(true, 180.0, 60.0), Some(Entry::Browser));
+        assert_eq!(hit_strip(false, 600, 10.0, 10.0), Some(Entry::Start));
+        assert_eq!(hit_strip(false, 600, 10.0, 60.0), Some(Entry::Browser));
+        assert_eq!(hit_strip(false, 600, 10.0, 580.0), Some(Entry::Power));
+        assert_eq!(hit_strip(false, 600, 49.0, 10.0), None);
+        assert_eq!(hit_strip(true, 600, 180.0, 60.0), Some(Entry::Browser));
+    }
+
+    #[test]
+    fn power_menu_hits_the_three_actions() {
+        let (x, y) = power_menu_origin(600);
+        assert_eq!(hit_power_action(600, f64::from(x + 8), f64::from(y + 8)), Some(PowerAction::Logout));
+        assert_eq!(
+            hit_power_action(600, f64::from(x + 8), f64::from(y + 48 + 8)),
+            Some(PowerAction::Shutdown)
+        );
+        assert_eq!(
+            hit_power_action(600, f64::from(x + 8), f64::from(y + 96 + 8)),
+            Some(PowerAction::Reboot)
+        );
+        assert_eq!(hit_power_action(600, 0.0, 0.0), None);
+        assert_eq!(hit_power_action(600, f64::from(x + 8), f64::from(y + 40)), None);
     }
 
     #[test]
     fn strip_buffer_covers_the_panel() {
-        let buf = paint_strip(STRIP_COLLAPSED, 100, false, Page::Start);
+        let buf = paint_strip(STRIP_COLLAPSED, 100, false, Page::Start, false);
         assert_eq!(buf.len(), (STRIP_COLLAPSED * 100 * 4) as usize);
     }
 
@@ -363,28 +408,38 @@ mod tests {
     }
 
     #[test]
-    fn cursor_tip_is_opaque_and_the_opposite_corner_is_clear() {
+    fn cursor_is_antialiased_and_the_hotspot_sits_on_the_tip() {
         let cursor = paint_cursor();
-        assert_eq!(&cursor.pixels[0..4], &[22, 20, 20, 255]);
-        let last = cursor.pixels.len() - 4;
-        assert_eq!(&cursor.pixels[last..], &[0, 0, 0, 0]);
-        assert_eq!((cursor.hot_x, cursor.hot_y), (0, 0));
+        assert_eq!((cursor.width, cursor.height), (32, 32));
+        assert_eq!((cursor.hot_x, cursor.hot_y), (5, 2));
+        let tip = ((cursor.hot_y * cursor.width + cursor.hot_x) * 4) as usize;
+        assert_eq!(cursor.pixels[tip + 3], 255);
+        assert!(cursor.pixels.chunks(4).any(|pixel| pixel[3] > 0 && pixel[3] < 255));
     }
 
     #[test]
-    fn startup_bar_fills_without_reaching_the_end() {
-        assert!(startup_fraction(0) < 0.05);
-        assert!(startup_fraction(8_000) > startup_fraction(1_000));
-        assert!(startup_fraction(120_000) < 1.0);
-        let bar = paint_startup_bar(0.5);
-        assert_eq!(bar.len(), (BAR_W * BAR_H * 4) as usize);
+    fn startup_mark_moves_without_claiming_a_fraction() {
+        assert_eq!(startup_phase(0), 0.0);
+        assert!(startup_phase(700) > startup_phase(0));
+        assert!(startup_phase(1_400) < 0.01);
+        let early = paint_startup_bar(0.0);
+        let later = paint_startup_bar(0.6);
+        assert_eq!(early.len(), (BAR_W * BAR_H * 4) as usize);
+        assert_ne!(early, later);
     }
 
     #[test]
-    fn start_and_browser_icons_differ() {
-        let buf = paint_strip(STRIP_COLLAPSED, 96, false, Page::Start);
+    fn start_and_browser_icons_differ_and_are_antialiased() {
+        let buf = paint_strip(STRIP_COLLAPSED, 600, false, Page::Start, false);
         let start = ((24 * STRIP_COLLAPSED + 24) * 4) as usize;
         let browser = ((72 * STRIP_COLLAPSED + 24) * 4) as usize;
         assert_ne!(&buf[start..start + 3], &buf[browser..browser + 3]);
+        let menu = paint_power_menu();
+        assert_eq!(menu.len(), (MENU_W * MENU_H * 4) as usize);
+        let row = |y: i32| {
+            let start = (y * MENU_W * 4) as usize;
+            menu[start..start + (MENU_W * 4) as usize].to_vec()
+        };
+        assert_ne!(row(20), row(68));
     }
 }
