@@ -1,12 +1,12 @@
-# Anforderungen
+# Requirements
 
-Stand des Konzepts. Noch nichts davon ist gebaut.
+Current concept. None of this is built yet.
 
-Zwei Schichten, damit sich Vorgaben und Ideen auseinanderhalten lassen:
+Two layers, so requirements and ideas stay apart:
 
-- `user-stories/` hält fest, was die Oberfläche können soll. Das sind die Anforderungen.
-- `technical/01-grenzen.md` hält die Geräteklasse fest, ohne ein konkretes Modell zu nennen.
-- `technical/02-umsetzungsvorschlaege.md` sammelt Wege, die sich aus dem Gespräch ergeben haben. Das sind keine Beschlüsse.
-- `technical/03-offene-punkte.md` listet, was noch gewählt werden muss.
+- `user-stories/` records what the shell should do. These are the requirements.
+- `technical/01-constraints.md` records the device class, without naming a specific model.
+- `technical/02-implementation-proposals.md` collects approaches that came out of the discussion. These are not decisions.
+- `technical/03-open-points.md` lists what still has to be chosen.
 
-Eine User Story wird geändert, wenn sich die Vorgabe ändert. Ein Vorschlag kann verworfen werden, ohne dass eine Story falsch wird.
+A user story changes when the requirement changes. A proposal can be dropped without making a story wrong.
