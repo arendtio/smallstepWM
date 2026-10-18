@@ -381,6 +381,8 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         Some(state.voice.note.clone())
     } else if !state.pages_note.is_empty() {
         Some(state.pages_note.clone())
+    } else if !state.power_note.is_empty() {
+        Some(state.power_note.clone())
     } else {
         None
     };

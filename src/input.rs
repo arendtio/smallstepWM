@@ -756,14 +756,33 @@ impl State {
 
     fn run_power(&mut self, action: PowerAction) {
         self.power_menu = false;
-        self.mark_dirty();
+        self.power_note.clear();
         match action {
             PowerAction::Logout => {
                 tracing::info!("log out");
                 std::process::exit(0);
             }
-            PowerAction::Shutdown => request_session("poweroff"),
-            PowerAction::Reboot => request_session("reboot"),
+            PowerAction::Shutdown => self.finish_power("poweroff"),
+            PowerAction::Reboot => self.finish_power("reboot"),
+        }
+        self.mark_dirty();
+    }
+
+    fn finish_power(&mut self, verb: &str) {
+        // No polkit agent is running, so an interactive prompt cannot be answered.
+        // --no-ask-password fails immediately instead of waiting on that prompt.
+        match Command::new("loginctl").args(power_args(verb)).output() {
+            Ok(output) if output.status.success() => tracing::info!(verb, "asked logind"),
+            Ok(output) => {
+                let note = power_failure(verb, &String::from_utf8_lossy(&output.stderr));
+                tracing::error!(verb, note, "logind refused");
+                self.power_note = note;
+            }
+            Err(err) => {
+                let note = power_failure(verb, &err.to_string());
+                tracing::error!(verb, note, "loginctl failed");
+                self.power_note = note;
+            }
         }
     }
 
@@ -796,11 +815,17 @@ impl State {
     }
 }
 
-fn request_session(verb: &str) {
-    match Command::new("loginctl").arg(verb).status() {
-        Ok(status) if status.success() => tracing::info!(verb, "asked logind"),
-        Ok(status) => tracing::error!(verb, ?status, "logind refused"),
-        Err(err) => tracing::error!(verb, ?err, "loginctl failed"),
+fn power_args(verb: &str) -> [&str; 2] {
+    ["--no-ask-password", verb]
+}
+
+fn power_failure(verb: &str, detail: &str) -> String {
+    let detail: String = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let detail: String = detail.chars().take(72).collect();
+    if detail.is_empty() {
+        format!("{verb} was refused")
+    } else {
+        detail
     }
 }
 
@@ -844,6 +869,17 @@ mod tests {
         assert_eq!(scroll_step(true, Some(0.0)), ScrollStep::Stop);
         assert_eq!(scroll_step(false, Some(0.0)), ScrollStep::Skip);
         assert_eq!(scroll_step(true, None), ScrollStep::Skip);
+    }
+
+    #[test]
+    fn power_request_does_not_wait_for_a_password() {
+        assert_eq!(power_args("poweroff"), ["--no-ask-password", "poweroff"]);
+        assert_eq!(power_args("reboot"), ["--no-ask-password", "reboot"]);
+        assert_eq!(
+            power_failure("poweroff", "Interactive authentication required.\n"),
+            "Interactive authentication required."
+        );
+        assert_eq!(power_failure("reboot", "   "), "reboot was refused");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Maintainer: smallstepwm
 pkgname=smallstepwm
 pkgver=0.1.0
-pkgrel=8
+pkgrel=9
 pkgdesc='Small Wayland shell'
 arch=('x86_64')
 url='https://github.com/arendtio/smallstepWM'
@@ -17,6 +17,7 @@ depends=(
   'firefox'
   'alsa-utils'
   'ca-certificates'
+  'polkit'
 )
 makedepends=('rust' 'cargo' 'pkgconf' 'clang')
 options=('!lto' '!debug')
@@ -32,4 +33,5 @@ package() {
   install -Dm755 target/release/smallstepwm "$pkgdir/usr/bin/smallstepwm"
   install -Dm755 packaging/smallstep-session "$pkgdir/usr/bin/smallstep-session"
   install -Dm644 packaging/smallstep.desktop "$pkgdir/usr/share/wayland-sessions/smallstep.desktop"
+  install -Dm644 packaging/smallstep-power.rules "$pkgdir/usr/share/polkit-1/rules.d/smallstep-power.rules"
 }
