@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Smallstep
+Comment=Small Wayland shell
+Exec=/usr/bin/smallstep-session
+Type=Application
+DesktopNames=smallstep

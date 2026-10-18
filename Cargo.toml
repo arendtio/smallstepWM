@@ -1,0 +1,28 @@
+[package]
+name = "smallstepwm"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "A small Wayland shell"
+publish = false
+
+[dependencies]
+smithay = { version = "0.6", default-features = false, features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "desktop",
+    "renderer_pixman",
+    "wayland_frontend",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true

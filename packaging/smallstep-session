@@ -1,0 +1,5 @@
+#!/bin/sh
+export XDG_CURRENT_DESKTOP=smallstep
+export XDG_SESSION_TYPE=wayland
+export MOZ_ENABLE_WAYLAND=1
+exec /usr/bin/smallstepwm
