@@ -2,11 +2,14 @@ use std::{ffi::OsString, time::Instant};
 
 use smithay::{
     desktop::{PopupManager, Space, Window},
-    input::{Seat, SeatState},
+    input::{Seat, SeatState, keyboard::XkbConfig},
     output::Output,
-    reexports::wayland_server::{
-        DisplayHandle,
-        backend::{ClientData, ClientId, DisconnectReason},
+    reexports::{
+        calloop::LoopHandle,
+        wayland_server::{
+            DisplayHandle,
+            backend::{ClientData, ClientId, DisconnectReason},
+        },
     },
     utils::{Logical, Point, Size},
     wayland::{
@@ -18,7 +21,7 @@ use smithay::{
     },
 };
 
-use crate::shell::Page;
+use crate::{keyboard, shell::Page};
 
 pub struct State {
     pub display_handle: DisplayHandle,
@@ -44,6 +47,9 @@ pub struct State {
     pub strip_expanded: bool,
     pub page: Page,
     pub browser_launched: bool,
+    pub browser_starting: Option<Instant>,
+    pub startup_timer: bool,
+    pub loop_handle: Option<LoopHandle<'static, Self>>,
     pub strip_grab: bool,
     pub dirty: bool,
     pub frame_pending: bool,
@@ -61,8 +67,35 @@ impl State {
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "seat0");
-        seat.add_keyboard(Default::default(), 200, 25)
-            .expect("keyboard");
+        let layout = keyboard::load();
+        tracing::info!(
+            layout = %layout.layout,
+            variant = %layout.variant,
+            source = layout.source,
+            "keyboard layout"
+        );
+        // Clients such as Firefox read the keymap from the seat. Setting the variables keeps
+        // later processes on the same layout. This runs before any other thread exists.
+        unsafe {
+            std::env::set_var("XKB_DEFAULT_LAYOUT", &layout.layout);
+            if !layout.variant.is_empty() {
+                std::env::set_var("XKB_DEFAULT_VARIANT", &layout.variant);
+            }
+            if !layout.model.is_empty() {
+                std::env::set_var("XKB_DEFAULT_MODEL", &layout.model);
+            }
+            if let Some(options) = &layout.options {
+                std::env::set_var("XKB_DEFAULT_OPTIONS", options);
+            }
+        }
+        let config = XkbConfig {
+            rules: "",
+            model: &layout.model,
+            layout: &layout.layout,
+            variant: &layout.variant,
+            options: layout.options.clone(),
+        };
+        seat.add_keyboard(config, 200, 25).expect("keyboard");
         seat.add_pointer();
 
         Self {
@@ -84,6 +117,9 @@ impl State {
             strip_expanded: false,
             page: Page::Start,
             browser_launched: false,
+            browser_starting: None,
+            startup_timer: false,
+            loop_handle: None,
             strip_grab: false,
             dirty: true,
             frame_pending: false,

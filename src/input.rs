@@ -1,6 +1,10 @@
-use std::process::Command;
+use std::{
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use smithay::{
+    reexports::calloop::timer::{TimeoutAction, Timer},
     backend::input::{
         AbsolutePositionEvent, Axis, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
         PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, ButtonState,
@@ -176,14 +180,46 @@ impl State {
         if self.browser_launched {
             command.arg("--new-window");
         }
-        command
+        match command
             .env("MOZ_ENABLE_WAYLAND", "1")
             .env("WAYLAND_DISPLAY", &self.socket_name)
             .stdin(std::process::Stdio::null())
             .spawn()
-            .map(|_| {
+        {
+            Ok(_) => {
                 self.browser_launched = true;
+                self.browser_starting = Some(Instant::now());
+                self.arm_startup_feedback();
+            }
+            Err(err) => tracing::error!(?err, "failed to start firefox"),
+        }
+    }
+
+    fn arm_startup_feedback(&mut self) {
+        if self.startup_timer {
+            return;
+        }
+        let Some(handle) = self.loop_handle.clone() else {
+            return;
+        };
+        self.startup_timer = true;
+        let timer = Timer::from_duration(Duration::from_millis(90));
+        if handle
+            .insert_source(timer, |_, _, state| {
+                let waiting = state.browser_starting.is_some() && state.space.elements().next().is_none();
+                if waiting {
+                    state.mark_dirty();
+                    TimeoutAction::ToDuration(Duration::from_millis(90))
+                } else {
+                    state.browser_starting = None;
+                    state.startup_timer = false;
+                    state.mark_dirty();
+                    TimeoutAction::Drop
+                }
             })
-            .unwrap_or_else(|err| tracing::error!(?err, "failed to start firefox"));
+            .is_err()
+        {
+            self.startup_timer = false;
+        }
     }
 }

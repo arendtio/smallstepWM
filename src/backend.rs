@@ -9,17 +9,15 @@ use smithay::{
             Bind, Color32F, ImportAll, ImportMem,
             damage::OutputDamageTracker,
             element::{
-                Kind,
+                AsRenderElements, Kind,
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
-                solid::{SolidColorBuffer, SolidColorRenderElement},
-                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+                surface::WaylandSurfaceRenderElement,
             },
             pixman::PixmanRenderer,
         },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev,
     },
-    desktop::PopupManager,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{EventLoop, Interest, LoopHandle, Mode as CalloopMode, PostAction, generic::Generic},
@@ -35,7 +33,7 @@ use smithay::{
         rustix::fs::OFlags,
         wayland_server::Display,
     },
-    utils::{DeviceFd, Point, Transform},
+    utils::{DeviceFd, Point, Scale, Transform},
     wayland::socket::ListeningSocketSource,
 };
 
@@ -58,7 +56,8 @@ pub struct Gpu {
     pub background: MemoryRenderBuffer,
     pub strip: MemoryRenderBuffer,
     pub strip_key: (bool, Page, i32, i32),
-    pub cursor: SolidColorBuffer,
+    pub cursor: MemoryRenderBuffer,
+    pub cursor_hot: (i32, i32),
     pub crtc: crtc::Handle,
     pub connector: connector::Handle,
     pub mode: control::Mode,
@@ -70,7 +69,6 @@ smithay::backend::renderer::element::render_elements! {
     pub ShellElement<R> where R: ImportAll + ImportMem;
     Surface = WaylandSurfaceRenderElement<R>,
     Memory = MemoryRenderBufferRenderElement<R>,
-    Solid = SolidColorRenderElement,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -78,6 +76,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<State> = Display::new()?;
     let socket_name = listen(&mut event_loop, &mut display)?;
     let mut state = State::new(&mut display, socket_name);
+    state.loop_handle = Some(event_loop.handle());
     // SAFETY: the display source lives as long as the loop, and dispatch does not drop it.
     event_loop
         .handle()
@@ -218,6 +217,7 @@ fn open_gpu(
     let damage = OutputDamageTracker::from_output(&output);
     let background = background_buffer(state.output_size.w, state.output_size.h);
     let strip = strip_buffer(state.output_size.h, false, Page::Start);
+    let (cursor, cursor_hot) = cursor_buffer();
     Ok(Gpu {
         renderer,
         drm,
@@ -227,7 +227,8 @@ fn open_gpu(
         background,
         strip,
         strip_key: (false, Page::Start, state.output_size.w, state.output_size.h),
-        cursor: SolidColorBuffer::new((8, 8), Color32F::new(0.93, 0.93, 0.9, 1.0)),
+        cursor,
+        cursor_hot,
         crtc: picked.crtc,
         connector: picked.connector,
         mode: picked.mode,
@@ -311,7 +312,21 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
     let expanded = state.strip_expanded;
     let size = state.output_size;
     let pointer = state.pointer;
-    let windows: Vec<_> = state.space.elements().cloned().collect();
+    let windows: Vec<_> = state
+        .space
+        .elements()
+        .filter_map(|window| {
+            let loc = state.space.element_location(window)?;
+            Some((window.clone(), loc))
+        })
+        .collect();
+    let startup = if windows.is_empty() {
+        state
+            .browser_starting
+            .map(|started| shell::startup_fraction(started.elapsed().as_millis()))
+    } else {
+        None
+    };
 
     let gpu = state.gpu.as_mut().ok_or("no gpu")?;
     if gpu.strip_key != (expanded, page, size.w, size.h) {
@@ -320,17 +335,22 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
     }
 
     let mut elements: Vec<ShellElement<PixmanRenderer>> = Vec::new();
-    let cursor_at = Point::<i32, smithay::utils::Physical>::from((
-        (pointer.x as i32 - 4).max(0),
-        (pointer.y as i32 - 4).max(0),
+    let cursor_at = (
+        pointer.x as i32 - gpu.cursor_hot.0,
+        pointer.y as i32 - gpu.cursor_hot.1,
+    );
+    elements.push(ShellElement::Memory(
+        MemoryRenderBufferRenderElement::from_buffer(
+            &mut gpu.renderer,
+            (f64::from(cursor_at.0), f64::from(cursor_at.1)),
+            &gpu.cursor,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        )
+        .map_err(|err| err.to_string())?,
     ));
-    elements.push(ShellElement::Solid(SolidColorRenderElement::from_buffer(
-        &gpu.cursor,
-        cursor_at,
-        1.0,
-        1.0,
-        Kind::Cursor,
-    )));
     elements.push(ShellElement::Memory(
         MemoryRenderBufferRenderElement::from_buffer(
             &mut gpu.renderer,
@@ -343,31 +363,42 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         )
         .map_err(|err| err.to_string())?,
     ));
+    if let Some(fraction) = startup {
+        let pixels = shell::paint_startup_bar(fraction);
+        let bar = MemoryRenderBuffer::from_slice(
+            &pixels,
+            Fourcc::Argb8888,
+            (shell::BAR_W, shell::BAR_H),
+            1,
+            Transform::Normal,
+            None,
+        );
+        let content_w = (size.w - shell::STRIP_COLLAPSED).max(1);
+        let x = shell::STRIP_COLLAPSED + (content_w - shell::BAR_W) / 2;
+        let y = (size.h - shell::BAR_H) / 2;
+        elements.push(ShellElement::Memory(
+            MemoryRenderBufferRenderElement::from_buffer(
+                &mut gpu.renderer,
+                (f64::from(x), f64::from(y)),
+                &bar,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            )
+            .map_err(|err| err.to_string())?,
+        ));
+    }
 
     if page == Page::Browser {
-        if let Some(window) = windows.last() {
-            if let Some(top) = window.toplevel() {
-                let surfaces = render_elements_from_surface_tree::<_, ShellElement<_>>(
-                    &mut gpu.renderer,
-                    top.wl_surface(),
-                    (0, 0),
-                    1.0,
-                    1.0,
-                    Kind::Unspecified,
-                );
-                elements.extend(surfaces);
-                for (popup, loc) in PopupManager::popups_for_surface(top.wl_surface()) {
-                    let at = Point::<i32, smithay::utils::Physical>::from((loc.x, loc.y));
-                    elements.extend(render_elements_from_surface_tree::<_, ShellElement<_>>(
-                        &mut gpu.renderer,
-                        popup.wl_surface(),
-                        at,
-                        1.0,
-                        1.0,
-                        Kind::Unspecified,
-                    ));
-                }
-            }
+        if let Some((window, loc)) = windows.last() {
+            let at = Point::<i32, smithay::utils::Physical>::from((loc.x, loc.y));
+            elements.extend(window.render_elements(
+                &mut gpu.renderer,
+                at,
+                Scale::from(1.0),
+                1.0,
+            ));
         }
     }
 
@@ -384,7 +415,7 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         .map_err(|err| err.to_string())?,
     ));
 
-    // Front to back: cursor, strip, window, then the gradient.
+    // Front to back: cursor, strip, startup bar, window, then the gradient.
     let index = gpu.displayed.map(|shown| (shown + 1) % gpu.buffers.len()).unwrap_or(0);
     paint_scanout(gpu, index, &elements)?;
     present(gpu, index)
@@ -477,6 +508,19 @@ fn background_buffer(width: i32, height: i32) -> MemoryRenderBuffer {
         Transform::Normal,
         None,
     )
+}
+
+fn cursor_buffer() -> (MemoryRenderBuffer, (i32, i32)) {
+    let cursor = shell::paint_cursor();
+    let buffer = MemoryRenderBuffer::from_slice(
+        &cursor.pixels,
+        Fourcc::Argb8888,
+        (cursor.width, cursor.height),
+        1,
+        Transform::Normal,
+        None,
+    );
+    (buffer, (cursor.hot_x, cursor.hot_y))
 }
 
 fn strip_buffer(height: i32, expanded: bool, page: Page) -> MemoryRenderBuffer {

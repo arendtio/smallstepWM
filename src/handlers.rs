@@ -29,7 +29,7 @@ use smithay::{
 };
 
 use crate::{
-    shell::Page,
+    shell::{self, Page},
     state::{ClientState, State},
 };
 
@@ -98,7 +98,8 @@ impl XdgShellHandler for State {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let size = self.output_size;
+        let (width, height) = shell::content_size(self.output_size.w, self.output_size.h);
+        let size = smithay::utils::Size::<i32, smithay::utils::Logical>::from((width, height));
         surface.with_pending_state(|state| {
             state.size = Some(size);
             state.states.set(xdg_toplevel::State::Maximized);
@@ -106,8 +107,10 @@ impl XdgShellHandler for State {
         });
         surface.send_pending_configure();
         let window = smithay::desktop::Window::new_wayland_window(surface);
-        self.space.map_element(window.clone(), (0, 0), true);
+        let (x, y) = shell::content_origin();
+        self.space.map_element(window.clone(), (x, y), true);
         self.page = Page::Browser;
+        self.browser_starting = None;
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         if let Some(top) = window.toplevel() {
             self.seat.get_keyboard().unwrap().set_focus(

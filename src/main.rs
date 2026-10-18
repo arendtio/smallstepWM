@@ -1,6 +1,7 @@
 mod backend;
 mod handlers;
 mod input;
+mod keyboard;
 mod shell;
 mod state;
 

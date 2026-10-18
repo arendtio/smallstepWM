@@ -14,5 +14,10 @@ Approaches from the concept discussion. Not requirements. Any item can be droppe
 - Fixed icons for network, sound, power, and voice sit at the bottom of the strip. Only the middle section scrolls.
 - The Fn keys for brightness, volume, mute, sleep, display, and touchpad stay a direct path and work without the API.
 - Shell commands that change the system or reach widely need a visible boundary before they run.
-- The first build is the strip, the shell-drawn start view, and Firefox as one fullscreen window, plus the package and the SDDM session. Voice, MCP, and mouse-driven Wi-Fi come after that. In that first build Firefox keeps its own toolbar, and the strip lists the browser window rather than each page.
+- The first build is the strip, the shell-drawn start view, and Firefox as one window, plus the package and the SDDM session. Voice, MCP, and mouse-driven Wi-Fi come after that. In that first build Firefox keeps its own toolbar, and the strip lists the browser window rather than each page.
+- The resting strip stays visible, so the browser window is placed at its right edge and sized to the remaining output. Growing the strip on hover still overlays that window and does not resize it.
+- The pointer is a software arrow drawn by the shell. There is no cursor plane and no cursor-theme package.
+- Strip icons are drawn in the same buffer (a star for the start view, a globe for the browser). No icon theme and no image decoder.
+- While Firefox has been spawned and no window is mapped yet, the shell draws a startup bar on the content area. A timer runs only during that wait.
+- The seat keymap comes from the compositor. SDDM does not pass the console map into a Wayland session, and an empty xkbcommon layout falls back to `us`. The shell reads `XKB_DEFAULT_LAYOUT`, then `/etc/X11/xorg.conf.d/00-keyboard.conf`, then `KEYMAP` in `/etc/vconsole.conf`.
 - The package is built with makepkg against current Arch, in a container or chroot, and handed over as one `.pkg.tar.zst` file. The laptop installs it with `pacman -U`. Publishing to the AUR is not part of that handoff.
