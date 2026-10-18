@@ -1,20 +1,13 @@
-use std::{io, time::Duration};
+use std::time::Duration;
 
 use smithay::{
     backend::{
-        allocator::{
-            Allocator, Fourcc, Modifier,
-            dumb::{DumbAllocator, DumbBuffer},
-            gbm::GbmDevice,
-        },
-        drm::{
-            DrmDevice, DrmDeviceFd, DrmEvent,
-            compositor::FrameFlags,
-            output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
-        },
+        allocator::Fourcc,
+        drm::{DrmDevice, DrmDeviceFd, DrmEvent},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-            renderer::{
-            Color32F, ImportAll, ImportDma, ImportMem,
+        renderer::{
+            Bind, Color32F, ImportAll, ImportMem,
+            damage::OutputDamageTracker,
             element::{
                 Kind,
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
@@ -30,8 +23,15 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{EventLoop, Interest, LoopHandle, Mode as CalloopMode, PostAction, generic::Generic},
-        drm::control::{self, Device as ControlDevice, ModeTypeFlags, connector, crtc},
+        drm::{
+            buffer::Buffer as DrmBuffer,
+            control::{
+                self, Device as ControlDevice, ModeTypeFlags, PageFlipFlags, connector, crtc, dumbbuffer,
+                framebuffer,
+            },
+        },
         input::Libinput,
+        pixman,
         rustix::fs::OFlags,
         wayland_server::Display,
     },
@@ -39,22 +39,9 @@ use smithay::{
     wayland::socket::ListeningSocketSource,
 };
 
-#[derive(Debug, Clone)]
-pub(crate) struct SharedDumb(DrmDeviceFd);
-
-impl Allocator for SharedDumb {
-    type Buffer = DumbBuffer;
-    type Error = io::Error;
-
-    fn create_buffer(
-        &mut self,
-        width: u32,
-        height: u32,
-        fourcc: Fourcc,
-        modifiers: &[Modifier],
-    ) -> Result<DumbBuffer, io::Error> {
-        DumbAllocator::new(self.0.clone()).create_buffer(width, height, fourcc, modifiers)
-    }
+pub(crate) struct ScanBuffer {
+    dumb: dumbbuffer::DumbBuffer,
+    fb: framebuffer::Handle,
 }
 
 use crate::{
@@ -64,13 +51,19 @@ use crate::{
 
 pub struct Gpu {
     pub renderer: PixmanRenderer,
-    pub drm: DrmOutputManager<SharedDumb, DrmDeviceFd, (), DrmDeviceFd>,
-    pub surface: DrmOutput<SharedDumb, DrmDeviceFd, (), DrmDeviceFd>,
+    pub drm: DrmDevice,
+    pub fd: DrmDeviceFd,
+    pub buffers: Vec<ScanBuffer>,
+    pub damage: OutputDamageTracker,
     pub background: MemoryRenderBuffer,
     pub strip: MemoryRenderBuffer,
     pub strip_key: (bool, Page, i32, i32),
     pub cursor: SolidColorBuffer,
     pub crtc: crtc::Handle,
+    pub connector: connector::Handle,
+    pub mode: control::Mode,
+    pub displayed: Option<usize>,
+    pub pending: Option<usize>,
 }
 
 smithay::backend::renderer::element::render_elements! {
@@ -108,10 +101,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!(socket = ?state.socket_name, "session ready");
 
-    pump(&mut state);
+    pump(&mut state)?;
+    if state.gpu.as_ref().is_some_and(|gpu| gpu.displayed.is_none()) {
+        return Err("the first frame was not shown".into());
+    }
     event_loop.run(None, &mut state, |state| {
         let _ = state.display_handle.flush_clients();
-        pump(state);
+        if let Err(err) = pump(state) {
+            tracing::error!(%err, "draw");
+        }
     })?;
     Ok(())
 }
@@ -172,6 +170,10 @@ fn open_gpu(
                     if let Err(err) = gpu.drm.activate(false) {
                         tracing::error!(?err, "drm resume");
                     }
+                    gpu.pending = None;
+                    if let Err(err) = restore_scanout(gpu) {
+                        tracing::error!(?err, "restore scanout");
+                    }
                 }
                 state.frame_pending = false;
                 state.mark_dirty();
@@ -210,51 +212,67 @@ fn open_gpu(
     state.output_size = mode.size.to_logical(1);
     state.output = Some(output.clone());
 
-    let mut renderer = PixmanRenderer::new().map_err(|err| err.to_string())?;
-    let renderer_formats = renderer.dmabuf_formats();
-    let gbm: Option<GbmDevice<DrmDeviceFd>> = None;
-    let mut drm_manager = DrmOutputManager::new(
-        drm,
-        SharedDumb(fd.clone()),
-        fd,
-        gbm,
-        [Fourcc::Xrgb8888],
-        renderer_formats,
-    );
-    let elements = DrmOutputRenderElements::<PixmanRenderer, ShellElement<PixmanRenderer>>::default();
-    let surface = drm_manager.initialize_output(
-        picked.crtc,
-        picked.mode,
-        &[picked.connector],
-        &output,
-        None,
-        &mut renderer,
-        &elements,
-    )?;
-
+    let renderer = PixmanRenderer::new().map_err(|err| err.to_string())?;
+    let (width, height) = picked.mode.size();
+    let buffers = alloc_scan_buffers(&fd, (u32::from(width), u32::from(height)))?;
+    let damage = OutputDamageTracker::from_output(&output);
     let background = background_buffer(state.output_size.w, state.output_size.h);
     let strip = strip_buffer(state.output_size.h, false, Page::Start);
     Ok(Gpu {
         renderer,
-        drm: drm_manager,
-        surface,
+        drm,
+        fd,
+        buffers,
+        damage,
         background,
         strip,
         strip_key: (false, Page::Start, state.output_size.w, state.output_size.h),
         cursor: SolidColorBuffer::new((8, 8), Color32F::new(0.93, 0.93, 0.9, 1.0)),
         crtc: picked.crtc,
+        connector: picked.connector,
+        mode: picked.mode,
+        displayed: None,
+        pending: None,
     })
+}
+
+fn alloc_scan_buffers(fd: &DrmDeviceFd, size: (u32, u32)) -> Result<Vec<ScanBuffer>, Box<dyn std::error::Error>> {
+    let mut buffers = Vec::new();
+    for index in 0..2 {
+        match alloc_scan_buffer(fd, size) {
+            Ok(buffer) => buffers.push(buffer),
+            Err(err) if index == 0 => {
+                return Err(format!("creating the scanout buffer failed: {err}").into());
+            }
+            Err(err) => {
+                tracing::warn!(?err, "second scanout buffer unavailable, using setcrtc");
+                break;
+            }
+        }
+    }
+    Ok(buffers)
+}
+
+fn alloc_scan_buffer(fd: &DrmDeviceFd, size: (u32, u32)) -> std::io::Result<ScanBuffer> {
+    let dumb = fd.create_dumb_buffer(size, Fourcc::Xrgb8888, 32)?;
+    match fd.add_framebuffer(&dumb, 24, 32) {
+        Ok(fb) => Ok(ScanBuffer { dumb, fb }),
+        Err(err) => {
+            let _ = fd.destroy_dumb_buffer(dumb);
+            Err(err)
+        }
+    }
 }
 
 fn on_vblank(state: &mut State, crtc: crtc::Handle) {
     let Some(gpu) = state.gpu.as_mut() else {
         return;
     };
-    if gpu.crtc != crtc {
+    if gpu.pending.is_none() && gpu.crtc != crtc {
         return;
     }
-    if let Err(err) = gpu.surface.frame_submitted() {
-        tracing::warn!(?err, "frame submitted");
+    if let Some(index) = gpu.pending.take() {
+        gpu.displayed = Some(index);
     }
     state.frame_pending = false;
     if let Some(output) = state.output.clone() {
@@ -267,19 +285,23 @@ fn on_vblank(state: &mut State, crtc: crtc::Handle) {
     state.popups.cleanup();
 }
 
-pub fn pump(state: &mut State) {
+pub fn pump(state: &mut State) -> Result<(), Box<dyn std::error::Error>> {
     if !state.dirty || state.frame_pending || state.gpu.is_none() {
-        return;
+        return Ok(());
     }
     match draw(state) {
         Ok(true) => {
             state.dirty = false;
             state.frame_pending = true;
+            Ok(())
         }
-        Ok(false) => state.dirty = false,
-        Err(err) => {
-            tracing::error!(?err, "draw");
+        Ok(false) => {
             state.dirty = false;
+            Ok(())
+        }
+        Err(err) => {
+            state.dirty = false;
+            Err(err)
         }
     }
 }
@@ -362,27 +384,87 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         .map_err(|err| err.to_string())?,
     ));
 
-    // render_frame walks front to back: cursor, strip, window, then the gradient.
-    let result = gpu.surface.render_frame(
-        &mut gpu.renderer,
-        &elements,
-        Color32F::new(0.08, 0.09, 0.11, 1.0),
-        FrameFlags::empty(),
-    );
-    match result {
-        Ok(_) => match gpu.surface.queue_frame(()) {
-            Ok(()) => Ok(true),
-            Err(err) => {
-                let text = err.to_string();
-                if text.contains("Empty") {
-                    Ok(false)
-                } else {
-                    Err(text.into())
-                }
-            }
-        },
-        Err(err) => Err(err.to_string().into()),
+    // Front to back: cursor, strip, window, then the gradient.
+    let index = gpu.displayed.map(|shown| (shown + 1) % gpu.buffers.len()).unwrap_or(0);
+    paint_scanout(gpu, index, &elements)?;
+    present(gpu, index)
+}
+
+fn paint_scanout(
+    gpu: &mut Gpu,
+    index: usize,
+    elements: &[ShellElement<PixmanRenderer>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (width, height) = DrmBuffer::size(&gpu.buffers[index].dumb);
+    let pitch = DrmBuffer::pitch(&gpu.buffers[index].dumb) as usize;
+    let mut mapping = gpu.fd.map_dumb_buffer(&mut gpu.buffers[index].dumb).map_err(|err| {
+        format!(
+            "mapping the dumb buffer failed: {err} (os error {:?})",
+            err.raw_os_error()
+        )
+    })?;
+    let format = pixman::FormatCode::try_from(Fourcc::Xrgb8888).map_err(|_| "unsupported scanout format")?;
+    // The mapping stays alive until this function returns, after the image is dropped.
+    let mut image = unsafe {
+        pixman::Image::from_raw_mut(
+            format,
+            width as usize,
+            height as usize,
+            mapping.as_mut_ptr() as *mut u32,
+            pitch,
+            false,
+        )
     }
+    .map_err(|_| "creating the scanout image failed")?;
+    let mut target = gpu.renderer.bind(&mut image).map_err(|err| err.to_string())?;
+    gpu.damage
+        .render_output(
+            &mut gpu.renderer,
+            &mut target,
+            0,
+            elements,
+            Color32F::new(0.08, 0.09, 0.11, 1.0),
+        )
+        .map_err(|err| err.to_string())?;
+    drop(target);
+    drop(image);
+    drop(mapping);
+    Ok(())
+}
+
+fn present(gpu: &mut Gpu, index: usize) -> Result<bool, Box<dyn std::error::Error>> {
+    let fb = gpu.buffers[index].fb;
+    if gpu.displayed.is_none() || gpu.buffers.len() == 1 {
+        gpu.fd
+            .set_crtc(gpu.crtc, Some(fb), (0, 0), &[gpu.connector], Some(gpu.mode))
+            .map_err(|err| format!("setting the display mode failed: {err} (os error {:?})", err.raw_os_error()))?;
+        gpu.displayed = Some(index);
+        return Ok(false);
+    }
+    match gpu.fd.page_flip(gpu.crtc, fb, PageFlipFlags::EVENT, None) {
+        Ok(()) => {
+            gpu.pending = Some(index);
+            Ok(true)
+        }
+        Err(err) if err.raw_os_error() == Some(95) || err.raw_os_error() == Some(22) => {
+            gpu.fd
+                .set_crtc(gpu.crtc, Some(fb), (0, 0), &[gpu.connector], Some(gpu.mode))
+                .map_err(|err| format!("setting the display mode failed: {err}"))?;
+            gpu.displayed = Some(index);
+            Ok(false)
+        }
+        Err(err) => Err(format!("page flip failed: {err} (os error {:?})", err.raw_os_error()).into()),
+    }
+}
+
+fn restore_scanout(gpu: &mut Gpu) -> Result<(), String> {
+    let Some(index) = gpu.displayed else {
+        return Ok(());
+    };
+    let fb = gpu.buffers[index].fb;
+    gpu.fd
+        .set_crtc(gpu.crtc, Some(fb), (0, 0), &[gpu.connector], Some(gpu.mode))
+        .map_err(|err| format!("setting the display mode failed: {err} (os error {:?})", err.raw_os_error()))
 }
 
 fn background_buffer(width: i32, height: i32) -> MemoryRenderBuffer {
