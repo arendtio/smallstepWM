@@ -23,6 +23,7 @@ use crate::{
     handlers::surface_at,
     shell::{self, Entry, Page, PowerAction, WifiHit},
     state::State,
+    voice::{self, Report},
     wifi::{self, PasswordEdit, WifiJob},
 };
 
@@ -61,9 +62,15 @@ impl State {
                     serial,
                     time,
                     |state, _, keysym| {
+                        let sym = keysym.modified_sym();
+                        if sym.raw() == smithay::input::keyboard::keysyms::KEY_F1 {
+                            if voice::f1_edge(&mut state.voice_f1_down, pressed) {
+                                state.toggle_voice();
+                            }
+                            return FilterResult::Intercept(());
+                        }
                         if state.wifi.open && state.wifi.password_for.is_some() {
                             if pressed {
-                                let sym = keysym.modified_sym();
                                 let text = smithay::input::keyboard::xkb::keysym_to_utf8(sym);
                                 state.edit_password(sym.raw(), &text);
                             }
@@ -216,6 +223,7 @@ impl State {
                 self.power_menu = false;
                 self.close_wifi();
             }
+            Entry::Voice => self.toggle_voice(),
             Entry::Network => {
                 self.power_menu = false;
                 if self.wifi.open {
@@ -272,8 +280,145 @@ impl State {
         }
     }
 
+    pub fn apply_voice(&mut self, report: Report) {
+        match report {
+            Report::Status {
+                generation,
+                connecting,
+                live,
+                note,
+            } => {
+                if generation != self.voice.generation {
+                    return;
+                }
+                self.voice.connecting = connecting;
+                self.voice.live = live;
+                self.voice.note = note;
+                self.mark_dirty();
+            }
+            Report::Tool {
+                generation,
+                name,
+                arguments,
+                reply,
+            } => self.voice_tool(generation, name, arguments, reply),
+        }
+    }
+
+    fn toggle_voice(&mut self) {
+        if self.voice.live || self.voice.connecting {
+            self.stop_voice();
+            return;
+        }
+        self.voice_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.voice_stop = std::sync::Arc::clone(&stop);
+        self.voice.generation = self.voice.generation.wrapping_add(1);
+        self.voice.connecting = true;
+        self.voice.live = false;
+        self.voice.note = "Connecting".into();
+        let generation = self.voice.generation;
+        let Some(tx) = self.voice_tx.clone() else {
+            self.voice.connecting = false;
+            self.voice.note = "Voice is not ready".into();
+            self.mark_dirty();
+            return;
+        };
+        self.mark_dirty();
+        if std::thread::Builder::new()
+            .name("voice".into())
+            .spawn(move || voice::run(tx, stop, generation))
+            .is_err()
+        {
+            self.voice.connecting = false;
+            self.voice.note = "Could not start voice".into();
+        }
+    }
+
+    fn stop_voice(&mut self) {
+        self.voice_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.voice.generation = self.voice.generation.wrapping_add(1);
+        self.voice.connecting = false;
+        self.voice.live = false;
+        self.voice.note.clear();
+        self.mark_dirty();
+    }
+
+    fn voice_tool(
+        &mut self,
+        generation: u64,
+        name: String,
+        arguments: String,
+        reply: tokio::sync::oneshot::Sender<String>,
+    ) {
+        if generation != self.voice.generation {
+            let _ = reply.send("session ended".into());
+            return;
+        }
+        match name.as_str() {
+            "switch_entry" => {
+                let _ = reply.send(self.voice_switch(&arguments));
+            }
+            "end_voice_session" | "wait_for_user" => {
+                let _ = reply.send("{\"ok\":true}".into());
+            }
+            "run_command" => {
+                self.voice.note = crate::tools::command_preview(&arguments);
+                self.mark_dirty();
+                std::thread::spawn(move || {
+                    let _ = reply.send(crate::tools::run_command_tool(&arguments));
+                });
+            }
+            "wifi_radio" | "wifi_connect" | "wifi_disconnect" => {
+                let tx = self.wifi_tx.clone();
+                std::thread::spawn(move || {
+                    let (text, report) = crate::tools::wifi_tool(&name, &arguments);
+                    if let (Some(tx), Some(report)) = (tx, report) {
+                        let _ = tx.send(report);
+                    }
+                    let _ = reply.send(text);
+                });
+            }
+            "bluetooth_setup" => {
+                self.voice.note = "Bluetooth".into();
+                self.mark_dirty();
+                std::thread::spawn(move || {
+                    let _ = reply.send(crate::tools::bluetooth_tool(&arguments));
+                });
+            }
+            _ => {
+                let _ = reply.send("unknown tool".into());
+            }
+        }
+    }
+
+    fn voice_switch(&mut self, arguments: &str) -> String {
+        let entry = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| value.get("entry").and_then(|entry| entry.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        match entry.as_str() {
+            "start" => {
+                self.page = Page::Start;
+                self.power_menu = false;
+                self.mark_dirty();
+                "showing start".into()
+            }
+            "browser" => {
+                self.page = Page::Browser;
+                self.power_menu = false;
+                if self.space.elements().next().is_none() {
+                    self.launch_browser();
+                }
+                self.mark_dirty();
+                "showing browser".into()
+            }
+            _ => "entry must be start or browser".into(),
+        }
+    }
+
     pub fn apply_wifi(&mut self, report: wifi::WifiReport) {
-        if report.generation != self.wifi.generation {
+        if report.generation != 0 && report.generation != self.wifi.generation {
             return;
         }
         self.wifi.busy = false;

@@ -1,7 +1,7 @@
 # Maintainer: smallstepwm
 pkgname=smallstepwm
 pkgver=0.1.0
-pkgrel=5
+pkgrel=6
 pkgdesc='Small Wayland shell'
 arch=('x86_64')
 url='https://github.com/arendtio/smallstepWM'
@@ -15,6 +15,8 @@ depends=(
   'libdrm'
   'wayland'
   'firefox'
+  'alsa-utils'
+  'ca-certificates'
 )
 makedepends=('rust' 'cargo' 'pkgconf' 'clang')
 options=('!lto' '!debug')

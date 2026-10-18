@@ -4,7 +4,7 @@ Not decided yet. Until a decision, the user story stands, and the related propos
 
 - Firefox or Chromium, as a separate program or embedded.
 - Whether web documents that are not visible get unloaded.
-- Whether sound and voice are strip entries or direct switches. Network and power are strip entries that open a panel.
+- Whether sound is a strip entry or a direct switch. Network and power open a panel. Voice is a strip entry and the F1 toggle.
 - Whether the shell handles the Fn keys itself.
 - Which video resolution and codec are tolerable on the device. That is measured there.
 - Whether the chosen talk key sends the F1 keycode on the device.

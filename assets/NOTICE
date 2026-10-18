@@ -9,8 +9,8 @@ Source: assets/src/cursor.svg
 
 Icons
 
-House, globe, and wifi are from Lucide (not in the Feather set).
-The wifi mark is in assets/src/wifi.svg.
+House, globe, wifi, and the microphone are from Lucide (not in the Feather set).
+The wifi mark is in assets/src/wifi.svg. The microphone is in assets/src/voice.svg.
 Copyright (c) 2026 Lucide Icons and Contributors.
 License: ISC.
 

@@ -7,6 +7,9 @@ description = "A small Wayland shell"
 publish = false
 
 [dependencies]
+base64 = "0.23.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+serde_json = "1.0.154"
 smithay = { version = "0.6", default-features = false, features = [
     "backend_drm",
     "backend_gbm",
@@ -17,6 +20,8 @@ smithay = { version = "0.6", default-features = false, features = [
     "renderer_pixman",
     "wayland_frontend",
 ] }
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "time", "sync", "macros", "io-util", "net"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
 

@@ -1,4 +1,8 @@
-use std::{ffi::OsString, time::Instant};
+use std::{
+    ffi::OsString,
+    sync::{atomic::AtomicBool, Arc},
+    time::Instant,
+};
 
 use smithay::{
     desktop::{PopupManager, Space, Window},
@@ -21,7 +25,7 @@ use smithay::{
     },
 };
 
-use crate::{keyboard, shell::Page, wifi};
+use crate::{keyboard, shell::Page, voice, wifi};
 
 pub struct State {
     pub display_handle: DisplayHandle,
@@ -49,6 +53,10 @@ pub struct State {
     pub power_menu: bool,
     pub wifi: wifi::Panel,
     pub wifi_tx: Option<Sender<wifi::WifiReport>>,
+    pub voice: voice::Session,
+    pub voice_tx: Option<Sender<voice::Report>>,
+    pub voice_stop: Arc<AtomicBool>,
+    pub voice_f1_down: bool,
     pub browser_launched: bool,
     pub browser_starting: Option<Instant>,
     pub startup_timer: bool,
@@ -122,6 +130,10 @@ impl State {
             power_menu: false,
             wifi: wifi::Panel::default(),
             wifi_tx: None,
+            voice: voice::Session::default(),
+            voice_tx: None,
+            voice_stop: Arc::new(AtomicBool::new(false)),
+            voice_f1_down: false,
             browser_launched: false,
             browser_starting: None,
             startup_timer: false,

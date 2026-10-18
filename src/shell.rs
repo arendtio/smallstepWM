@@ -14,6 +14,7 @@ pub enum Page {
 pub enum Entry {
     Start,
     Browser,
+    Voice,
     Network,
     Power,
 }
@@ -82,11 +83,14 @@ pub fn hit_strip(expanded: bool, height: i32, x: f64, y: f64) -> Option<Entry> {
     if x < 0.0 || y < 0.0 || x >= f64::from(strip_width(expanded)) || y >= f64::from(height.max(0)) {
         return None;
     }
-    if y >= f64::from(height - ROW) {
+    if height >= ROW && y >= f64::from(height - ROW) {
         return Some(Entry::Power);
     }
-    if y >= f64::from(height - 2 * ROW) {
+    if height >= 2 * ROW && y >= f64::from(height - 2 * ROW) {
         return Some(Entry::Network);
+    }
+    if height >= 3 * ROW && y >= f64::from(height - 3 * ROW) {
+        return Some(Entry::Voice);
     }
     let row = (y / f64::from(ROW)) as i32;
     match row {
@@ -144,7 +148,15 @@ pub fn paint_gradient(buf: &mut [u8], width: i32, height: i32) {
     }
 }
 
-pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page, network_open: bool, power_open: bool) -> Vec<u8> {
+pub fn paint_strip(
+    width: i32,
+    height: i32,
+    expanded: bool,
+    page: Page,
+    network_open: bool,
+    power_open: bool,
+    voice_live: bool,
+) -> Vec<u8> {
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
@@ -153,7 +165,7 @@ pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page, network_
     }
     for (index, entry) in [Entry::Start, Entry::Browser].into_iter().enumerate() {
         let row_y = index as i32 * ROW;
-        if row_y + ROW > height - 2 * ROW {
+        if row_y + ROW > height - 3 * ROW {
             break;
         }
         let active = match (page, entry) {
@@ -161,6 +173,17 @@ pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page, network_
             _ => false,
         };
         paint_row(&mut pixels, width, height, row_y, expanded, active, entry);
+    }
+    if height >= 3 * ROW {
+        paint_row(
+            &mut pixels,
+            width,
+            height,
+            height - 3 * ROW,
+            expanded,
+            voice_live,
+            Entry::Voice,
+        );
     }
     if height >= 2 * ROW {
         paint_row(
@@ -186,6 +209,7 @@ fn paint_row(buf: &mut [u8], width: i32, height: i32, row_y: i32, expanded: bool
     let icon = match entry {
         Entry::Start => image(include_bytes!("../assets/start.bgra")),
         Entry::Browser => image(include_bytes!("../assets/browser.bgra")),
+        Entry::Voice => image(include_bytes!("../assets/voice.bgra")),
         Entry::Network => image(include_bytes!("../assets/wifi.bgra")),
         Entry::Power => image(include_bytes!("../assets/power.bgra")),
     };
@@ -194,6 +218,7 @@ fn paint_row(buf: &mut [u8], width: i32, height: i32, row_y: i32, expanded: bool
         let label = match entry {
             Entry::Start => "Start",
             Entry::Browser => "Browser",
+            Entry::Voice => "Voice",
             Entry::Network => "Wifi",
             Entry::Power => "Power",
         };
@@ -222,6 +247,8 @@ fn draw_text(buf: &mut [u8], width: i32, height: i32, x: i32, y: i32, text: &str
 fn glyph(ch: char) -> [u8; 7] {
     match ch {
         'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'c' => [0b00000, 0b00000, 0b01110, 0b10000, 0b10000, 0b10001, 0b01110],
         'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010, 0b01010],
         'f' => [0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000],
         'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
@@ -396,6 +423,16 @@ fn blit(buf: &mut [u8], width: i32, height: i32, x: i32, y: i32, src: &Image) {
 fn blend(from: u8, to: u8, y: u32, last: u32) -> u8 {
     let v = u32::from(from) * (last - y) + u32::from(to) * y;
     (v / last) as u8
+}
+
+pub fn paint_voice_note(text: &str) -> (Vec<u8>, i32, i32) {
+    let text: String = text.chars().take(42).collect();
+    let width = (16 + text.chars().count() as i32 * 9).clamp(48, 400);
+    let height = 22;
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    fill_rect(&mut pixels, width, height, 0, 0, width, height, 42, 45, 54);
+    draw_text8(&mut pixels, width, 8, 6, &text, 230, 226, 216, width - 4);
+    (pixels, width, height)
 }
 
 pub fn wifi_origin(output_h: i32) -> (i32, i32) {
@@ -573,6 +610,7 @@ mod tests {
     fn collapsed_strip_ignores_clicks_past_the_icons() {
         assert_eq!(hit_strip(false, 600, 10.0, 10.0), Some(Entry::Start));
         assert_eq!(hit_strip(false, 600, 10.0, 60.0), Some(Entry::Browser));
+        assert_eq!(hit_strip(false, 600, 10.0, 470.0), Some(Entry::Voice));
         assert_eq!(hit_strip(false, 600, 10.0, 520.0), Some(Entry::Network));
         assert_eq!(hit_strip(false, 600, 10.0, 580.0), Some(Entry::Power));
         assert_eq!(hit_strip(false, 600, 49.0, 10.0), None);
@@ -597,7 +635,7 @@ mod tests {
 
     #[test]
     fn strip_buffer_covers_the_panel() {
-        let buf = paint_strip(STRIP_COLLAPSED, 100, false, Page::Start, false, false);
+        let buf = paint_strip(STRIP_COLLAPSED, 100, false, Page::Start, false, false, false);
         assert_eq!(buf.len(), (STRIP_COLLAPSED * 100 * 4) as usize);
     }
 
@@ -630,7 +668,9 @@ mod tests {
 
     #[test]
     fn start_and_browser_icons_differ_and_are_antialiased() {
-        let buf = paint_strip(STRIP_COLLAPSED, 600, false, Page::Start, false, false);
+        let buf = paint_strip(STRIP_COLLAPSED, 600, false, Page::Start, false, false, false);
+        let (note, note_w, note_h) = paint_voice_note("Live");
+        assert_eq!(note.len(), (note_w * note_h * 4) as usize);
         let start = ((24 * STRIP_COLLAPSED + 24) * 4) as usize;
         let browser = ((72 * STRIP_COLLAPSED + 24) * 4) as usize;
         assert_ne!(&buf[start..start + 3], &buf[browser..browser + 3]);

@@ -9,4 +9,4 @@ What the shell should do, kept apart from how a particular version is built.
 
 A user story changes when the requirement changes. A proposal can be dropped without making a story wrong.
 
-The current package covers the shell, the left strip, the start view, Firefox as one window, power controls, mouse-driven Wi-Fi, the Arch package, and the SDDM session. Voice and MCP are later.
+The current package covers the shell, the left strip, the start view, Firefox as one window, power controls, mouse-driven Wi-Fi, the voice toggle, the in-process tools, the Arch package, and the SDDM session.

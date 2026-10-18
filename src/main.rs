@@ -5,6 +5,8 @@ mod input;
 mod keyboard;
 mod shell;
 mod state;
+mod tools;
+mod voice;
 mod wifi;
 
 fn main() {
