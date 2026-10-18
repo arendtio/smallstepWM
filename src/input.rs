@@ -325,9 +325,22 @@ impl State {
             return;
         };
         self.mark_dirty();
+        let report_tx = tx.clone();
         if std::thread::Builder::new()
             .name("voice".into())
-            .spawn(move || voice::run(tx, stop, generation))
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    voice::run(tx, stop, generation);
+                }));
+                if let Err(payload) = result {
+                    let _ = report_tx.send(voice::Report::Status {
+                        generation,
+                        connecting: false,
+                        live: false,
+                        note: voice::panic_note(payload.as_ref()),
+                    });
+                }
+            })
             .is_err()
         {
             self.voice.connecting = false;
@@ -457,7 +470,18 @@ impl State {
         if std::thread::Builder::new()
             .name("wifi".into())
             .spawn(move || {
-                let _ = tx.send(wifi::perform(job));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wifi::perform(job)));
+                let report = match result {
+                    Ok(report) => report,
+                    Err(_) => wifi::WifiReport {
+                        generation,
+                        radio_on: None,
+                        device: None,
+                        networks: Vec::new(),
+                        note: "Wi-Fi failed".into(),
+                    },
+                };
+                let _ = tx.send(report);
             })
             .is_err()
         {

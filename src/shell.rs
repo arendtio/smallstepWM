@@ -426,8 +426,8 @@ fn blend(from: u8, to: u8, y: u32, last: u32) -> u8 {
 }
 
 pub fn paint_voice_note(text: &str) -> (Vec<u8>, i32, i32) {
-    let text: String = text.chars().take(42).collect();
-    let width = (16 + text.chars().count() as i32 * 9).clamp(48, 400);
+    let text: String = text.chars().take(72).collect();
+    let width = (16 + text.chars().count() as i32 * 9).clamp(48, 700);
     let height = 22;
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     fill_rect(&mut pixels, width, height, 0, 0, width, height, 42, 45, 54);

@@ -211,7 +211,29 @@ pub fn api_reachable() -> Result<(), String> {
         .map_err(|err| format!("Voice API is unreachable ({err})"))
 }
 
+pub fn install_tls() {
+    // rustls 0.23 has no process-wide provider until one is selected. The first
+    // connection panics without it, and a panic used to take the whole session down.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+pub fn panic_note(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    let detail: String = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let detail: String = detail.chars().take(80).collect();
+    if detail.is_empty() {
+        "Voice stopped".into()
+    } else {
+        format!("Voice stopped: {detail}")
+    }
+}
+
 pub fn run(tx: Sender<Report>, stop: Arc<AtomicBool>, generation: u64) {
+    install_tls();
     let fail = |note: String| {
         let _ = tx.send(Report::Status {
             generation,
@@ -601,5 +623,17 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(redact("rejected sk-test", "sk-test"), "rejected •••");
+    }
+
+    #[test]
+    fn tls_client_builds_without_a_provider_panic() {
+        install_tls();
+        let _config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        let payload: Box<dyn std::any::Any + Send> = Box::new("Could not automatically determine the CryptoProvider");
+        let note = panic_note(payload.as_ref());
+        assert!(note.starts_with("Voice stopped"));
     }
 }
