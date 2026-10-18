@@ -9,4 +9,4 @@ Not decided yet. Until a decision, the user story stands, and the related propos
 - Which video resolution and codec are tolerable on the device. That is measured there.
 - Whether the chosen talk key sends the F1 keycode on the device.
 - Whether `pacman -U` may fetch dependencies from the Arch mirrors, or whether the transferred file must install with no mirror access.
-- The first build does not yet meet the "one strip of pages" acceptance in full: Firefox keeps its toolbar, and the strip lists the browser window rather than each page.
+- Firefox's own tab strip is hidden, and its pages are entries in the shell strip. The address bar stays, so a page can be opened without voice. The strip still does not list foreign windows separately, and pages that are not visible are not unloaded.

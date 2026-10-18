@@ -3,6 +3,7 @@ mod font8x8;
 mod handlers;
 mod input;
 mod keyboard;
+mod pages;
 mod shell;
 mod state;
 mod tools;

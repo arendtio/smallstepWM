@@ -175,7 +175,7 @@ impl XdgShellHandler for State {
             self.space.unmap_elem(&window);
         }
         if self.space.elements().next().is_none() {
-            self.page = Page::Start;
+            self.browser_closed();
         }
         self.mark_dirty();
     }

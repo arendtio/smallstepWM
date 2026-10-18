@@ -21,6 +21,7 @@ use smithay::{
 
 use crate::{
     handlers::surface_at,
+    pages::{self, Command as PageCommand},
     shell::{self, Entry, Page, PowerAction, WifiHit},
     state::State,
     voice::{self, Report},
@@ -101,8 +102,10 @@ impl State {
                     }
                     return;
                 }
-                if self.strip_grab || shell::hit_strip(self.strip_expanded, self.output_size.h, self.pointer.x, self.pointer.y).is_some()
-                {
+                if self.strip_grab || self.strip_hit().is_some() {
+                    if let Some(amount) = event.amount(Axis::Vertical) {
+                        self.scroll_pages(amount);
+                    }
                     return;
                 }
                 self.point_pointer();
@@ -132,7 +135,7 @@ impl State {
 
     fn pointer_button(&mut self, button: u32, state: ButtonState, time: u32) {
         let serial = SERIAL_COUNTER.next_serial();
-        let on_strip = shell::hit_strip(self.strip_expanded, self.output_size.h, self.pointer.x, self.pointer.y);
+        let on_strip = self.strip_hit();
         if state == ButtonState::Pressed {
             if let Some(entry) = on_strip {
                 self.strip_grab = true;
@@ -199,7 +202,7 @@ impl State {
     fn point_pointer(&mut self) {
         let serial = SERIAL_COUNTER.next_serial();
         let h = self.output_size.h;
-        let over_chrome = shell::hit_strip(self.strip_expanded, h, self.pointer.x, self.pointer.y).is_some()
+        let over_chrome = self.strip_hit().is_some()
             || (self.wifi.open && shell::wifi_panel_contains(h, self.pointer.x, self.pointer.y))
             || (self.power_menu && shell::power_menu_contains(h, self.pointer.x, self.pointer.y));
         let under = if over_chrome { None } else { surface_at(self, self.pointer) };
@@ -241,30 +244,69 @@ impl State {
             Entry::Browser => {
                 self.power_menu = false;
                 self.close_wifi();
-                self.page = Page::Browser;
-                if self.space.elements().next().is_none() {
-                    self.launch_browser();
-                }
-                let serial = SERIAL_COUNTER.next_serial();
-                if let Some(window) = self.space.elements().last().cloned() {
-                    if let Some(top) = window.toplevel() {
-                        self.seat.get_keyboard().unwrap().set_focus(
-                            self,
-                            Some(top.wl_surface().clone()),
-                            serial,
-                        );
-                    }
-                }
+                self.show_browser();
+            }
+            Entry::Page(index) => {
+                self.power_menu = false;
+                self.close_wifi();
+                self.show_page(index);
             }
         }
         self.mark_dirty();
     }
 
-    fn launch_browser(&mut self) {
-        let mut command = Command::new("firefox");
-        if self.browser_launched {
-            command.arg("--new-window");
+    fn strip_hit(&self) -> Option<Entry> {
+        shell::hit_strip(
+            self.strip_expanded,
+            self.output_size.h,
+            self.pointer.x,
+            self.pointer.y,
+            self.pages.len(),
+            self.page_scroll,
+        )
+    }
+
+    fn show_browser(&mut self) {
+        self.page = Page::Browser;
+        if self.space.elements().next().is_none() {
+            self.launch_browser();
         }
+        self.focus_browser();
+    }
+
+    fn show_page(&mut self, index: usize) {
+        self.page = Page::Browser;
+        let slots = shell::page_slots(self.output_size.h);
+        self.page_scroll = shell::reveal_page(self.page_scroll, index, slots, self.pages.len());
+        if let Some(page) = self.pages.get(index) {
+            let context = page.context.clone();
+            self.active_context = Some(context.clone());
+            if let Some(tx) = &self.pages_cmd {
+                let _ = tx.send(PageCommand::Activate(context));
+            }
+        }
+        if self.space.elements().next().is_none() {
+            self.launch_browser();
+        }
+        self.focus_browser();
+    }
+
+    fn focus_browser(&mut self) {
+        let serial = SERIAL_COUNTER.next_serial();
+        if let Some(window) = self.space.elements().last().cloned() {
+            if let Some(top) = window.toplevel() {
+                self.seat.get_keyboard().unwrap().set_focus(self, Some(top.wl_surface().clone()), serial);
+            }
+        }
+    }
+
+    fn launch_browser(&mut self) -> bool {
+        let profile = pages::profile_dir();
+        if let Err(err) = pages::ensure_profile(&profile) {
+            tracing::error!(?err, "firefox profile");
+        }
+        let mut command = Command::new("firefox");
+        command.args(pages::launch_args(&profile, self.browser_launched));
         match command
             .env("MOZ_ENABLE_WAYLAND", "1")
             .env("WAYLAND_DISPLAY", &self.socket_name)
@@ -272,12 +314,109 @@ impl State {
             .spawn()
         {
             Ok(_) => {
+                let first = !self.browser_launched;
                 self.browser_launched = true;
                 self.browser_starting = Some(Instant::now());
                 self.arm_startup_feedback();
+                if first {
+                    self.start_pages();
+                }
+                true
             }
-            Err(err) => tracing::error!(?err, "failed to start firefox"),
+            Err(err) => {
+                tracing::error!(?err, "failed to start firefox");
+                false
+            }
         }
+    }
+
+    fn start_pages(&mut self) {
+        let Some(tx) = self.pages_tx.clone() else {
+            self.pages_note = "Page list is not ready".into();
+            return;
+        };
+        self.pages_generation = self.pages_generation.wrapping_add(1);
+        let generation = self.pages_generation;
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.pages_cmd = Some(cmd_tx);
+        let report_tx = tx.clone();
+        if std::thread::Builder::new()
+            .name("pages".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pages::run(cmd_rx, tx, generation)));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(note)) => {
+                        let _ = report_tx.send(pages::Report::Stopped { generation, note });
+                    }
+                    Err(payload) => {
+                        let _ = report_tx.send(pages::Report::Stopped {
+                            generation,
+                            note: pages::panic_note(payload.as_ref()),
+                        });
+                    }
+                }
+            })
+            .is_err()
+        {
+            self.pages_note = "Could not list pages".into();
+        }
+    }
+
+    pub fn browser_closed(&mut self) {
+        self.page = Page::Start;
+        self.browser_launched = false;
+        self.browser_starting = None;
+        self.pages.clear();
+        self.active_context = None;
+        self.page_scroll = 0;
+        self.pages_generation = self.pages_generation.wrapping_add(1);
+        self.pages_cmd = None;
+        self.pages_note.clear();
+        self.mark_dirty();
+    }
+
+    pub fn apply_pages(&mut self, report: pages::Report) {
+        match report {
+            pages::Report::Snapshot { generation, pages, active } => {
+                if generation != self.pages_generation {
+                    return;
+                }
+                self.pages = pages;
+                self.active_context = active;
+                let slots = shell::page_slots(self.output_size.h);
+                self.page_scroll = shell::clamp_page_scroll(self.page_scroll, self.pages.len(), slots);
+                self.pages_note.clear();
+                self.mark_dirty();
+            }
+            pages::Report::Stopped { generation, note } => {
+                if generation != self.pages_generation {
+                    return;
+                }
+                self.pages.clear();
+                self.active_context = None;
+                self.pages_cmd = None;
+                if !note.is_empty() {
+                    self.pages_note = note;
+                }
+                self.mark_dirty();
+            }
+        }
+    }
+
+    fn scroll_pages(&mut self, amount: f64) {
+        let slots = shell::page_slots(self.output_size.h);
+        if self.pages.len() <= slots as usize {
+            return;
+        }
+        self.page_scroll_carry += amount;
+        let steps = (self.page_scroll_carry / 24.0).trunc();
+        if steps == 0.0 {
+            return;
+        }
+        self.page_scroll_carry -= steps * 24.0;
+        self.page_scroll = shell::clamp_page_scroll(self.page_scroll + steps as i32, self.pages.len(), slots);
+        self.mark_dirty();
     }
 
     pub fn apply_voice(&mut self, report: Report) {
@@ -372,6 +511,7 @@ impl State {
             "switch_entry" => {
                 let _ = reply.send(self.voice_switch(&arguments));
             }
+            "open_page" => self.voice_open(&arguments, reply),
             "end_voice_session" | "wait_for_user" => {
                 let _ = reply.send("{\"ok\":true}".into());
             }
@@ -418,15 +558,59 @@ impl State {
                 "showing start".into()
             }
             "browser" => {
-                self.page = Page::Browser;
                 self.power_menu = false;
-                if self.space.elements().next().is_none() {
-                    self.launch_browser();
-                }
+                self.show_browser();
                 self.mark_dirty();
                 "showing browser".into()
             }
-            _ => "entry must be start or browser".into(),
+            _ => {
+                if let Some(index) = pages::pick(&self.pages, &entry) {
+                    self.power_menu = false;
+                    let label = pages::label(&self.pages[index].title, &self.pages[index].url);
+                    self.show_page(index);
+                    self.mark_dirty();
+                    format!("showing {label}")
+                } else {
+                    "no matching page".into()
+                }
+            }
+        }
+    }
+
+    fn voice_open(&mut self, arguments: &str, reply: tokio::sync::oneshot::Sender<String>) {
+        let raw = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| value.get("url").and_then(|url| url.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        let url = match pages::normalize_url(&raw) {
+            Ok(url) => url,
+            Err(err) => {
+                let _ = reply.send(err.into());
+                return;
+            }
+        };
+        if self.pages_cmd.is_none() {
+            if !self.browser_launched {
+                if !self.launch_browser() {
+                    let _ = reply.send("could not start the browser".into());
+                    return;
+                }
+            } else {
+                self.start_pages();
+            }
+        }
+        self.page = Page::Browser;
+        self.power_menu = false;
+        self.focus_browser();
+        self.mark_dirty();
+        let Some(tx) = &self.pages_cmd else {
+            let _ = reply.send("page list is not ready".into());
+            return;
+        };
+        if let Err(err) = tx.send(PageCommand::Open { url, reply }) {
+            if let PageCommand::Open { reply, .. } = err.0 {
+                let _ = reply.send("page list is not ready".into());
+            }
         }
     }
 

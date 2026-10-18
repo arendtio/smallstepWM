@@ -14,9 +14,15 @@ pub enum Page {
 pub enum Entry {
     Start,
     Browser,
+    Page(usize),
     Voice,
     Network,
     Power,
+}
+
+pub struct StripPage<'a> {
+    pub label: &'a str,
+    pub active: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,7 +85,46 @@ pub fn startup_phase(elapsed_ms: u128) -> f32 {
     (elapsed_ms % 1_400) as f32 / 1_400.0
 }
 
-pub fn hit_strip(expanded: bool, height: i32, x: f64, y: f64) -> Option<Entry> {
+/// How many page rows fit between Start and the fixed bottom icons.
+pub fn page_slots(height: i32) -> i32 {
+    let bottom = reserved_bottom(height);
+    let room = height - bottom - ROW;
+    if room <= 0 { 0 } else { room / ROW }
+}
+
+pub fn clamp_page_scroll(scroll: i32, count: usize, slots: i32) -> i32 {
+    let max = (count as i32 - slots).max(0);
+    scroll.clamp(0, max)
+}
+
+pub fn reveal_page(scroll: i32, index: usize, slots: i32, count: usize) -> i32 {
+    if slots <= 0 {
+        return 0;
+    }
+    let index = index as i32;
+    let mut scroll = clamp_page_scroll(scroll, count, slots);
+    if index < scroll {
+        scroll = index;
+    }
+    if index >= scroll + slots {
+        scroll = index - slots + 1;
+    }
+    clamp_page_scroll(scroll, count, slots)
+}
+
+fn reserved_bottom(height: i32) -> i32 {
+    if height >= 3 * ROW {
+        3 * ROW
+    } else if height >= 2 * ROW {
+        2 * ROW
+    } else if height >= ROW {
+        ROW
+    } else {
+        0
+    }
+}
+
+pub fn hit_strip(expanded: bool, height: i32, x: f64, y: f64, page_count: usize, scroll: i32) -> Option<Entry> {
     if x < 0.0 || y < 0.0 || x >= f64::from(strip_width(expanded)) || y >= f64::from(height.max(0)) {
         return None;
     }
@@ -92,12 +137,48 @@ pub fn hit_strip(expanded: bool, height: i32, x: f64, y: f64) -> Option<Entry> {
     if height >= 3 * ROW && y >= f64::from(height - 3 * ROW) {
         return Some(Entry::Voice);
     }
-    let row = (y / f64::from(ROW)) as i32;
-    match row {
-        0 => Some(Entry::Start),
-        1 => Some(Entry::Browser),
-        _ => None,
+    if y < f64::from(ROW) {
+        return Some(Entry::Start);
     }
+    let slots = page_slots(height);
+    if page_count == 0 {
+        if slots > 0 && y < f64::from(2 * ROW) {
+            return Some(Entry::Browser);
+        }
+        return None;
+    }
+    let slot = ((y - f64::from(ROW)) / f64::from(ROW)) as i32;
+    if slot < 0 || slot >= slots {
+        return None;
+    }
+    let index = scroll + slot;
+    if index >= 0 && (index as usize) < page_count {
+        Some(Entry::Page(index as usize))
+    } else {
+        None
+    }
+}
+
+pub fn strip_stamp(page: Page, pages: &[StripPage<'_>], scroll: i32) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    hash = mix(hash, &[match page {
+        Page::Start => 1,
+        Page::Browser => 2,
+    }]);
+    hash = mix(hash, &scroll.to_le_bytes());
+    for entry in pages {
+        hash = mix(hash, &[u8::from(entry.active)]);
+        hash = mix(hash, entry.label.as_bytes());
+    }
+    hash
+}
+
+fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Sits just to the right of the expanded strip, beside the power icon.
@@ -156,6 +237,8 @@ pub fn paint_strip(
     network_open: bool,
     power_open: bool,
     voice_live: bool,
+    pages: &[StripPage<'_>],
+    scroll: i32,
 ) -> Vec<u8> {
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for y in 0..height {
@@ -163,16 +246,23 @@ pub fn paint_strip(
             put(&mut pixels, width, x, y, 22, 24, 29);
         }
     }
-    for (index, entry) in [Entry::Start, Entry::Browser].into_iter().enumerate() {
-        let row_y = index as i32 * ROW;
-        if row_y + ROW > height - 3 * ROW {
-            break;
+    if row_fits(0, height) {
+        paint_row(&mut pixels, width, height, 0, expanded, page == Page::Start, Entry::Start);
+    }
+    if pages.is_empty() {
+        if row_fits(ROW, height) {
+            paint_row(&mut pixels, width, height, ROW, expanded, page == Page::Browser, Entry::Browser);
         }
-        let active = match (page, entry) {
-            (Page::Start, Entry::Start) | (Page::Browser, Entry::Browser) => true,
-            _ => false,
-        };
-        paint_row(&mut pixels, width, height, row_y, expanded, active, entry);
+    } else {
+        let slots = page_slots(height);
+        for slot in 0..slots {
+            let index = scroll + slot;
+            if index < 0 || index as usize >= pages.len() {
+                break;
+            }
+            let row_y = ROW + slot * ROW;
+            paint_page_row(&mut pixels, width, height, row_y, expanded, &pages[index as usize]);
+        }
     }
     if height >= 3 * ROW {
         paint_row(
@@ -202,13 +292,28 @@ pub fn paint_strip(
     pixels
 }
 
+fn row_fits(row_y: i32, height: i32) -> bool {
+    row_y >= 0 && row_y + ROW <= height - reserved_bottom(height)
+}
+
+fn paint_page_row(buf: &mut [u8], width: i32, height: i32, row_y: i32, expanded: bool, page: &StripPage<'_>) {
+    if page.active {
+        fill_rect(buf, width, height, 0, row_y, 3, ROW, 215, 196, 163);
+    }
+    let icon = image(include_bytes!("../assets/browser.bgra"));
+    blit(buf, width, height, 8, row_y + 8, &icon);
+    if expanded {
+        draw_text8(buf, width, 48, row_y + 20, page.label, 230, 226, 216, width - 8);
+    }
+}
+
 fn paint_row(buf: &mut [u8], width: i32, height: i32, row_y: i32, expanded: bool, active: bool, entry: Entry) {
     if active {
         fill_rect(buf, width, height, 0, row_y, 3, ROW, 215, 196, 163);
     }
     let icon = match entry {
         Entry::Start => image(include_bytes!("../assets/start.bgra")),
-        Entry::Browser => image(include_bytes!("../assets/browser.bgra")),
+        Entry::Browser | Entry::Page(_) => image(include_bytes!("../assets/browser.bgra")),
         Entry::Voice => image(include_bytes!("../assets/voice.bgra")),
         Entry::Network => image(include_bytes!("../assets/wifi.bgra")),
         Entry::Power => image(include_bytes!("../assets/power.bgra")),
@@ -217,7 +322,7 @@ fn paint_row(buf: &mut [u8], width: i32, height: i32, row_y: i32, expanded: bool
     if expanded {
         let label = match entry {
             Entry::Start => "Start",
-            Entry::Browser => "Browser",
+            Entry::Browser | Entry::Page(_) => "Browser",
             Entry::Voice => "Voice",
             Entry::Network => "Wifi",
             Entry::Power => "Power",
@@ -608,13 +713,20 @@ mod tests {
 
     #[test]
     fn collapsed_strip_ignores_clicks_past_the_icons() {
-        assert_eq!(hit_strip(false, 600, 10.0, 10.0), Some(Entry::Start));
-        assert_eq!(hit_strip(false, 600, 10.0, 60.0), Some(Entry::Browser));
-        assert_eq!(hit_strip(false, 600, 10.0, 470.0), Some(Entry::Voice));
-        assert_eq!(hit_strip(false, 600, 10.0, 520.0), Some(Entry::Network));
-        assert_eq!(hit_strip(false, 600, 10.0, 580.0), Some(Entry::Power));
-        assert_eq!(hit_strip(false, 600, 49.0, 10.0), None);
-        assert_eq!(hit_strip(true, 600, 180.0, 60.0), Some(Entry::Browser));
+        assert_eq!(hit_strip(false, 600, 10.0, 10.0, 0, 0), Some(Entry::Start));
+        assert_eq!(hit_strip(false, 600, 10.0, 60.0, 0, 0), Some(Entry::Browser));
+        assert_eq!(hit_strip(false, 600, 10.0, 470.0, 0, 0), Some(Entry::Voice));
+        assert_eq!(hit_strip(false, 600, 10.0, 520.0, 0, 0), Some(Entry::Network));
+        assert_eq!(hit_strip(false, 600, 10.0, 580.0, 0, 0), Some(Entry::Power));
+        assert_eq!(hit_strip(false, 600, 49.0, 10.0, 0, 0), None);
+        assert_eq!(hit_strip(true, 600, 180.0, 60.0, 0, 0), Some(Entry::Browser));
+        assert_eq!(hit_strip(false, 600, 10.0, 60.0, 3, 0), Some(Entry::Page(0)));
+        assert_eq!(hit_strip(false, 600, 10.0, 108.0, 3, 0), Some(Entry::Page(1)));
+        assert_eq!(hit_strip(false, 600, 10.0, 60.0, 3, 1), Some(Entry::Page(1)));
+        assert_eq!(hit_strip(false, 600, 10.0, 470.0, 3, 0), Some(Entry::Voice));
+        assert_eq!(page_slots(600), 8);
+        assert_eq!(clamp_page_scroll(9, 10, 8), 2);
+        assert_eq!(reveal_page(0, 9, 8, 10), 2);
     }
 
     #[test]
@@ -635,7 +747,7 @@ mod tests {
 
     #[test]
     fn strip_buffer_covers_the_panel() {
-        let buf = paint_strip(STRIP_COLLAPSED, 100, false, Page::Start, false, false, false);
+        let buf = paint_strip(STRIP_COLLAPSED, 100, false, Page::Start, false, false, false, &[], 0);
         assert_eq!(buf.len(), (STRIP_COLLAPSED * 100 * 4) as usize);
     }
 
@@ -668,7 +780,31 @@ mod tests {
 
     #[test]
     fn start_and_browser_icons_differ_and_are_antialiased() {
-        let buf = paint_strip(STRIP_COLLAPSED, 600, false, Page::Start, false, false, false);
+        let buf = paint_strip(STRIP_COLLAPSED, 600, false, Page::Start, false, false, false, &[], 0);
+        let wiki = paint_strip(
+            STRIP_EXPANDED,
+            600,
+            true,
+            Page::Browser,
+            false,
+            false,
+            false,
+            &[StripPage { label: "Wiki", active: true }],
+            0,
+        );
+        let news = paint_strip(
+            STRIP_EXPANDED,
+            600,
+            true,
+            Page::Browser,
+            false,
+            false,
+            false,
+            &[StripPage { label: "News", active: true }],
+            0,
+        );
+        assert_ne!(wiki, news);
+        assert_ne!(strip_stamp(Page::Browser, &[StripPage { label: "Wiki", active: true }], 0), strip_stamp(Page::Start, &[], 0));
         let (note, note_w, note_h) = paint_voice_note("Live");
         assert_eq!(note.len(), (note_w * note_h * 4) as usize);
         let start = ((24 * STRIP_COLLAPSED + 24) * 4) as usize;

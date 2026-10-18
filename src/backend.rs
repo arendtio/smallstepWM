@@ -56,7 +56,7 @@ pub struct Gpu {
     pub damage: OutputDamageTracker,
     pub background: MemoryRenderBuffer,
     pub strip: MemoryRenderBuffer,
-    pub strip_key: (bool, Page, bool, bool, bool, i32, i32),
+    pub strip_key: (bool, Page, bool, bool, bool, i32, i32, u64),
     pub power_menu: MemoryRenderBuffer,
     pub cursor: MemoryRenderBuffer,
     pub cursor_hot: (i32, i32),
@@ -96,6 +96,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .insert_source(voice_channel, |event, _, state| {
             if let smithay::reexports::calloop::channel::Event::Msg(report) = event {
                 state.apply_voice(report);
+            }
+        })
+        .map_err(|err| err.to_string())?;
+    let (pages_tx, pages_channel) = smithay::reexports::calloop::channel::channel();
+    state.pages_tx = Some(pages_tx);
+    event_loop
+        .handle()
+        .insert_source(pages_channel, |event, _, state| {
+            if let smithay::reexports::calloop::channel::Event::Msg(report) = event {
+                state.apply_pages(report);
             }
         })
         .map_err(|err| err.to_string())?;
@@ -243,7 +253,7 @@ fn open_gpu(
     let buffers = alloc_scan_buffers(&fd, (u32::from(width), u32::from(height)))?;
     let damage = OutputDamageTracker::from_output(&output);
     let background = background_buffer(state.output_size.w, state.output_size.h);
-    let strip = strip_buffer(state.output_size.h, false, Page::Start, false, false, false);
+    let strip = strip_buffer(state.output_size.h, false, Page::Start, false, false, false, &[], 0);
     let (cursor, cursor_hot) = cursor_buffer();
     Ok(Gpu {
         renderer,
@@ -253,7 +263,16 @@ fn open_gpu(
         damage,
         background,
         strip,
-        strip_key: (false, Page::Start, false, false, false, state.output_size.w, state.output_size.h),
+        strip_key: (
+            false,
+            Page::Start,
+            false,
+            false,
+            false,
+            state.output_size.w,
+            state.output_size.h,
+            shell::strip_stamp(Page::Start, &[], 0),
+        ),
         power_menu: power_menu_buffer(),
         cursor,
         cursor_hot,
@@ -358,11 +377,25 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
     let power_menu = state.power_menu;
     let network_open = state.wifi.open;
     let voice_live = state.voice.live;
-    let voice_note = if state.voice.note.is_empty() {
-        None
+    let hud_text = if !state.voice.note.is_empty() {
+        Some(state.voice.note.clone())
+    } else if !state.pages_note.is_empty() {
+        Some(state.pages_note.clone())
     } else {
-        Some(shell::paint_voice_note(&state.voice.note))
+        None
     };
+    let voice_note = hud_text.as_deref().map(shell::paint_voice_note);
+    let labels: Vec<String> = state.pages.iter().map(|page| crate::pages::label(&page.title, &page.url)).collect();
+    let page_rows: Vec<shell::StripPage<'_>> = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| shell::StripPage {
+            label,
+            active: page == Page::Browser && state.active_context.as_deref() == Some(state.pages[index].context.as_str()),
+        })
+        .collect();
+    let page_scroll = state.page_scroll;
+    let strip_stamp = shell::strip_stamp(page, &page_rows, page_scroll);
     let wifi_pixels = if network_open {
         let rows: Vec<shell::WifiPaint<'_>> = state
             .wifi
@@ -388,9 +421,9 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
     };
 
     let gpu = state.gpu.as_mut().ok_or("no gpu")?;
-    if gpu.strip_key != (expanded, page, network_open, power_menu, voice_live, size.w, size.h) {
-        gpu.strip = strip_buffer(size.h, expanded, page, network_open, power_menu, voice_live);
-        gpu.strip_key = (expanded, page, network_open, power_menu, voice_live, size.w, size.h);
+    if gpu.strip_key != (expanded, page, network_open, power_menu, voice_live, size.w, size.h, strip_stamp) {
+        gpu.strip = strip_buffer(size.h, expanded, page, network_open, power_menu, voice_live, &page_rows, page_scroll);
+        gpu.strip_key = (expanded, page, network_open, power_menu, voice_live, size.w, size.h, strip_stamp);
     }
 
     let mut elements: Vec<ShellElement<PixmanRenderer>> = Vec::new();
@@ -675,9 +708,11 @@ fn strip_buffer(
     network_open: bool,
     power_open: bool,
     voice_live: bool,
+    pages: &[shell::StripPage<'_>],
+    scroll: i32,
 ) -> MemoryRenderBuffer {
     let width = shell::strip_width(expanded);
-    let pixels = shell::paint_strip(width, height, expanded, page, network_open, power_open, voice_live);
+    let pixels = shell::paint_strip(width, height, expanded, page, network_open, power_open, voice_live, pages, scroll);
     MemoryRenderBuffer::from_slice(
         &pixels,
         Fourcc::Xrgb8888,

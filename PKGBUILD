@@ -1,7 +1,7 @@
 # Maintainer: smallstepwm
 pkgname=smallstepwm
 pkgver=0.1.0
-pkgrel=7
+pkgrel=8
 pkgdesc='Small Wayland shell'
 arch=('x86_64')
 url='https://github.com/arendtio/smallstepWM'

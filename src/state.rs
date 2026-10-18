@@ -25,7 +25,7 @@ use smithay::{
     },
 };
 
-use crate::{keyboard, shell::Page, voice, wifi};
+use crate::{keyboard, pages, shell::Page, voice, wifi};
 
 pub struct State {
     pub display_handle: DisplayHandle,
@@ -59,6 +59,14 @@ pub struct State {
     pub voice_f1_down: bool,
     pub browser_launched: bool,
     pub browser_starting: Option<Instant>,
+    pub pages: Vec<pages::Page>,
+    pub active_context: Option<String>,
+    pub page_scroll: i32,
+    pub page_scroll_carry: f64,
+    pub pages_cmd: Option<tokio::sync::mpsc::UnboundedSender<pages::Command>>,
+    pub pages_tx: Option<Sender<pages::Report>>,
+    pub pages_generation: u64,
+    pub pages_note: String,
     pub startup_timer: bool,
     pub loop_handle: Option<LoopHandle<'static, Self>>,
     pub strip_grab: bool,
@@ -136,6 +144,14 @@ impl State {
             voice_f1_down: false,
             browser_launched: false,
             browser_starting: None,
+            pages: Vec::new(),
+            active_context: None,
+            page_scroll: 0,
+            page_scroll_carry: 0.0,
+            pages_cmd: None,
+            pages_tx: None,
+            pages_generation: 0,
+            pages_note: String::new(),
             startup_timer: false,
             loop_handle: None,
             strip_grab: false,
