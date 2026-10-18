@@ -1,9 +1,11 @@
 mod backend;
+mod font8x8;
 mod handlers;
 mod input;
 mod keyboard;
 mod shell;
 mod state;
+mod wifi;
 
 fn main() {
     if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {

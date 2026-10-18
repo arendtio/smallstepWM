@@ -21,9 +21,17 @@ use smithay::{
 
 use crate::{
     handlers::surface_at,
-    shell::{self, Entry, Page, PowerAction},
+    shell::{self, Entry, Page, PowerAction, WifiHit},
     state::State,
+    wifi::{self, PasswordEdit, WifiJob},
 };
+
+enum WifiJobKind {
+    Refresh,
+    Radio(bool),
+    Connect { ssid: String, password: Option<String> },
+    Disconnect,
+}
 
 impl State {
     pub fn pointer_moved(&mut self, pos: Point<f64, Logical>) {
@@ -33,7 +41,7 @@ impl State {
             pos.y.clamp(0.0, (size.h.saturating_sub(1).max(0)) as f64),
         ));
         let over_strip = pos.x < f64::from(shell::strip_width(self.strip_expanded));
-        let expanded = self.power_menu || over_strip;
+        let expanded = self.power_menu || self.wifi.open || over_strip;
         self.pointer = pos;
         self.strip_expanded = expanded;
         self.point_pointer();
@@ -45,15 +53,24 @@ impl State {
             InputEvent::Keyboard { event } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time() as u32;
+                let pressed = event.state() == KeyState::Pressed;
                 self.seat.get_keyboard().unwrap().input::<(), _>(
                     self,
                     event.key_code(),
                     event.state(),
                     serial,
                     time,
-                    |_, _, _| {
-                        let _ = KeyState::Released;
-                        FilterResult::Forward
+                    |state, _, keysym| {
+                        if state.wifi.open && state.wifi.password_for.is_some() {
+                            if pressed {
+                                let sym = keysym.modified_sym();
+                                let text = smithay::input::keyboard::xkb::keysym_to_utf8(sym);
+                                state.edit_password(sym.raw(), &text);
+                            }
+                            FilterResult::Intercept(())
+                        } else {
+                            FilterResult::Forward
+                        }
                     },
                 );
             }
@@ -71,6 +88,12 @@ impl State {
                 event.time() as u32,
             ),
             InputEvent::PointerAxis { event } => {
+                if self.wifi.open && shell::wifi_panel_contains(self.output_size.h, self.pointer.x, self.pointer.y) {
+                    if let Some(amount) = event.amount(Axis::Vertical) {
+                        self.scroll_wifi(amount);
+                    }
+                    return;
+                }
                 if self.strip_grab || shell::hit_strip(self.strip_expanded, self.output_size.h, self.pointer.x, self.pointer.y).is_some()
                 {
                     return;
@@ -108,6 +131,20 @@ impl State {
                 self.strip_grab = true;
                 self.activate(entry);
                 return;
+            }
+            if self.wifi.open {
+                if let Some(hit) = shell::hit_wifi(
+                    self.output_size.h,
+                    self.pointer.x,
+                    self.pointer.y,
+                    self.wifi.networks.len(),
+                    self.wifi.scroll,
+                ) {
+                    self.strip_grab = true;
+                    self.wifi_hit(hit);
+                    return;
+                }
+                self.close_wifi();
             }
             if self.power_menu {
                 if let Some(action) = shell::hit_power_action(self.output_size.h, self.pointer.x, self.pointer.y) {
@@ -154,11 +191,11 @@ impl State {
 
     fn point_pointer(&mut self) {
         let serial = SERIAL_COUNTER.next_serial();
-        let under = if shell::hit_strip(self.strip_expanded, self.output_size.h, self.pointer.x, self.pointer.y).is_some() {
-            None
-        } else {
-            surface_at(self, self.pointer)
-        };
+        let h = self.output_size.h;
+        let over_chrome = shell::hit_strip(self.strip_expanded, h, self.pointer.x, self.pointer.y).is_some()
+            || (self.wifi.open && shell::wifi_panel_contains(h, self.pointer.x, self.pointer.y))
+            || (self.power_menu && shell::power_menu_contains(h, self.pointer.x, self.pointer.y));
+        let under = if over_chrome { None } else { surface_at(self, self.pointer) };
         let pointer = self.seat.get_pointer().unwrap();
         pointer.motion(
             self,
@@ -177,10 +214,25 @@ impl State {
             Entry::Start => {
                 self.page = Page::Start;
                 self.power_menu = false;
+                self.close_wifi();
             }
-            Entry::Power => self.power_menu = !self.power_menu,
+            Entry::Network => {
+                self.power_menu = false;
+                if self.wifi.open {
+                    self.close_wifi();
+                } else {
+                    self.wifi.open = true;
+                    self.wifi.note = "Scanning".into();
+                    self.start_wifi(WifiJobKind::Refresh);
+                }
+            }
+            Entry::Power => {
+                self.close_wifi();
+                self.power_menu = !self.power_menu;
+            }
             Entry::Browser => {
                 self.power_menu = false;
+                self.close_wifi();
                 self.page = Page::Browser;
                 if self.space.elements().next().is_none() {
                     self.launch_browser();
@@ -218,6 +270,135 @@ impl State {
             }
             Err(err) => tracing::error!(?err, "failed to start firefox"),
         }
+    }
+
+    pub fn apply_wifi(&mut self, report: wifi::WifiReport) {
+        if report.generation != self.wifi.generation {
+            return;
+        }
+        self.wifi.busy = false;
+        self.wifi.radio_on = report.radio_on;
+        self.wifi.device = report.device;
+        self.wifi.networks = report.networks;
+        self.wifi.scroll = shell::clamp_wifi_scroll(self.wifi.scroll, self.wifi.networks.len());
+        self.wifi.note = report.note;
+        self.mark_dirty();
+    }
+
+    fn close_wifi(&mut self) {
+        self.wifi.open = false;
+        self.wifi.password_for = None;
+        self.wifi.password.clear();
+        self.strip_expanded = self.power_menu || self.pointer.x < f64::from(shell::STRIP_COLLAPSED);
+        self.mark_dirty();
+    }
+
+    fn start_wifi(&mut self, kind: WifiJobKind) {
+        let Some(tx) = self.wifi_tx.clone() else {
+            self.wifi.note = "Wi-Fi is not ready".into();
+            self.mark_dirty();
+            return;
+        };
+        self.wifi.generation = self.wifi.generation.wrapping_add(1);
+        self.wifi.busy = true;
+        let generation = self.wifi.generation;
+        let job = match kind {
+            WifiJobKind::Refresh => WifiJob::Refresh { generation },
+            WifiJobKind::Radio(on) => WifiJob::Radio { generation, on },
+            WifiJobKind::Connect { ssid, password } => WifiJob::Connect { generation, ssid, password },
+            WifiJobKind::Disconnect => WifiJob::Disconnect { generation },
+        };
+        self.mark_dirty();
+        if std::thread::Builder::new()
+            .name("wifi".into())
+            .spawn(move || {
+                let _ = tx.send(wifi::perform(job));
+            })
+            .is_err()
+        {
+            self.wifi.busy = false;
+            self.wifi.note = "Could not start the scan".into();
+        }
+    }
+
+    fn wifi_hit(&mut self, hit: WifiHit) {
+        match hit {
+            WifiHit::Toggle => {
+                let on = self.wifi.radio_on != Some(true);
+                self.wifi.note = if on { "Turning on".into() } else { "Turning off".into() };
+                self.start_wifi(WifiJobKind::Radio(on));
+            }
+            WifiHit::Scan => {
+                self.wifi.note = "Scanning".into();
+                self.start_wifi(WifiJobKind::Refresh);
+            }
+            WifiHit::Row(index) | WifiHit::Disconnect(index) => {
+                let Some(net) = self.wifi.networks.get(index).cloned() else {
+                    return;
+                };
+                if net.connected {
+                    if matches!(hit, WifiHit::Disconnect(_)) {
+                        self.wifi.note = "Disconnecting".into();
+                        self.start_wifi(WifiJobKind::Disconnect);
+                    }
+                    return;
+                }
+                if net.secured {
+                    self.wifi.password_for = Some(net.ssid);
+                    self.wifi.password.clear();
+                    self.mark_dirty();
+                } else {
+                    self.wifi.note = "Connecting".into();
+                    self.start_wifi(WifiJobKind::Connect { ssid: net.ssid, password: None });
+                }
+            }
+            WifiHit::Join => self.submit_wifi(),
+        }
+    }
+
+    fn submit_wifi(&mut self) {
+        let Some(ssid) = self.wifi.password_for.clone() else {
+            return;
+        };
+        let password = std::mem::take(&mut self.wifi.password);
+        self.wifi.password_for = None;
+        let password = if password.is_empty() { None } else { Some(password) };
+        self.wifi.note = "Connecting".into();
+        self.start_wifi(WifiJobKind::Connect { ssid, password });
+    }
+
+    fn edit_password(&mut self, sym: u32, text: &str) {
+        match wifi::password_edit(sym, text) {
+            PasswordEdit::Cancel => {
+                self.wifi.password_for = None;
+                self.wifi.password.clear();
+            }
+            PasswordEdit::Submit => {
+                self.submit_wifi();
+                return;
+            }
+            PasswordEdit::Backspace => {
+                wifi::pop_char(&mut self.wifi.password);
+            }
+            PasswordEdit::Insert(extra) => {
+                if self.wifi.password.chars().count() < 128 {
+                    self.wifi.password.push_str(&extra);
+                }
+            }
+            PasswordEdit::Ignore => {}
+        }
+        self.mark_dirty();
+    }
+
+    fn scroll_wifi(&mut self, amount: f64) {
+        self.wifi.scroll_carry += amount;
+        let steps = (self.wifi.scroll_carry / 24.0).trunc();
+        if steps == 0.0 {
+            return;
+        }
+        self.wifi.scroll_carry -= steps * 24.0;
+        self.wifi.scroll = shell::clamp_wifi_scroll(self.wifi.scroll + steps as i32, self.wifi.networks.len());
+        self.mark_dirty();
     }
 
     fn run_power(&mut self, action: PowerAction) {

@@ -14,6 +14,7 @@ pub enum Page {
 pub enum Entry {
     Start,
     Browser,
+    Network,
     Power,
 }
 
@@ -48,6 +49,30 @@ pub const MENU_H: i32 = 136;
 const BTN_H: i32 = 40;
 const BTN_GAP: i32 = 8;
 
+pub const WIFI_W: i32 = 300;
+pub const WIFI_HEADER: i32 = 36;
+pub const WIFI_STATUS: i32 = 22;
+pub const WIFI_ROW: i32 = 30;
+pub const WIFI_VISIBLE: i32 = 6;
+pub const WIFI_PASS: i32 = 36;
+pub const WIFI_H: i32 = WIFI_HEADER + WIFI_STATUS + WIFI_VISIBLE * WIFI_ROW + WIFI_PASS;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WifiHit {
+    Toggle,
+    Scan,
+    Row(usize),
+    Disconnect(usize),
+    Join,
+}
+
+pub struct WifiPaint<'a> {
+    pub name: &'a str,
+    pub signal: u8,
+    pub secured: bool,
+    pub connected: bool,
+}
+
 /// Firefox does not report startup progress, so the mark loops instead of filling.
 pub fn startup_phase(elapsed_ms: u128) -> f32 {
     (elapsed_ms % 1_400) as f32 / 1_400.0
@@ -59,6 +84,9 @@ pub fn hit_strip(expanded: bool, height: i32, x: f64, y: f64) -> Option<Entry> {
     }
     if y >= f64::from(height - ROW) {
         return Some(Entry::Power);
+    }
+    if y >= f64::from(height - 2 * ROW) {
+        return Some(Entry::Network);
     }
     let row = (y / f64::from(ROW)) as i32;
     match row {
@@ -116,7 +144,7 @@ pub fn paint_gradient(buf: &mut [u8], width: i32, height: i32) {
     }
 }
 
-pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page, power_open: bool) -> Vec<u8> {
+pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page, network_open: bool, power_open: bool) -> Vec<u8> {
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
@@ -125,7 +153,7 @@ pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page, power_op
     }
     for (index, entry) in [Entry::Start, Entry::Browser].into_iter().enumerate() {
         let row_y = index as i32 * ROW;
-        if row_y + ROW > height - ROW {
+        if row_y + ROW > height - 2 * ROW {
             break;
         }
         let active = match (page, entry) {
@@ -133,6 +161,17 @@ pub fn paint_strip(width: i32, height: i32, expanded: bool, page: Page, power_op
             _ => false,
         };
         paint_row(&mut pixels, width, height, row_y, expanded, active, entry);
+    }
+    if height >= 2 * ROW {
+        paint_row(
+            &mut pixels,
+            width,
+            height,
+            height - 2 * ROW,
+            expanded,
+            network_open,
+            Entry::Network,
+        );
     }
     if height >= ROW {
         paint_row(&mut pixels, width, height, height - ROW, expanded, power_open, Entry::Power);
@@ -147,6 +186,7 @@ fn paint_row(buf: &mut [u8], width: i32, height: i32, row_y: i32, expanded: bool
     let icon = match entry {
         Entry::Start => image(include_bytes!("../assets/start.bgra")),
         Entry::Browser => image(include_bytes!("../assets/browser.bgra")),
+        Entry::Network => image(include_bytes!("../assets/wifi.bgra")),
         Entry::Power => image(include_bytes!("../assets/power.bgra")),
     };
     blit(buf, width, height, 8, row_y + 8, &icon);
@@ -154,6 +194,7 @@ fn paint_row(buf: &mut [u8], width: i32, height: i32, row_y: i32, expanded: bool
         let label = match entry {
             Entry::Start => "Start",
             Entry::Browser => "Browser",
+            Entry::Network => "Wifi",
             Entry::Power => "Power",
         };
         draw_text(buf, width, height, 48, row_y + 20, label);
@@ -181,6 +222,8 @@ fn draw_text(buf: &mut [u8], width: i32, height: i32, x: i32, y: i32, text: &str
 fn glyph(ch: char) -> [u8; 7] {
     match ch {
         'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010, 0b01010],
+        'f' => [0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000],
         'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
         'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
         'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
@@ -355,6 +398,162 @@ fn blend(from: u8, to: u8, y: u32, last: u32) -> u8 {
     (v / last) as u8
 }
 
+pub fn wifi_origin(output_h: i32) -> (i32, i32) {
+    (STRIP_EXPANDED + 12, (output_h - ROW - 8 - WIFI_H).max(0))
+}
+
+pub fn clamp_wifi_scroll(scroll: i32, count: usize) -> i32 {
+    let max = (count as i32 - WIFI_VISIBLE).max(0);
+    scroll.clamp(0, max)
+}
+
+pub fn wifi_panel_contains(output_h: i32, x: f64, y: f64) -> bool {
+    let (origin_x, origin_y) = wifi_origin(output_h);
+    x >= f64::from(origin_x)
+        && y >= f64::from(origin_y)
+        && x < f64::from(origin_x + WIFI_W)
+        && y < f64::from(origin_y + WIFI_H)
+}
+
+pub fn power_menu_contains(output_h: i32, x: f64, y: f64) -> bool {
+    let (origin_x, origin_y) = power_menu_origin(output_h);
+    x >= f64::from(origin_x)
+        && y >= f64::from(origin_y)
+        && x < f64::from(origin_x + MENU_W)
+        && y < f64::from(origin_y + MENU_H)
+}
+
+pub fn hit_wifi(output_h: i32, x: f64, y: f64, count: usize, scroll: i32) -> Option<WifiHit> {
+    if !wifi_panel_contains(output_h, x, y) {
+        return None;
+    }
+    let (origin_x, origin_y) = wifi_origin(output_h);
+    let local_x = x - f64::from(origin_x);
+    let local_y = y - f64::from(origin_y);
+    if local_y < f64::from(WIFI_HEADER) {
+        if local_x >= f64::from(WIFI_W - 64) {
+            return Some(WifiHit::Toggle);
+        }
+        if local_x >= 70.0 {
+            return Some(WifiHit::Scan);
+        }
+        return None;
+    }
+    if local_y >= f64::from(WIFI_H - WIFI_PASS) {
+        if local_x >= f64::from(WIFI_W - 64) {
+            return Some(WifiHit::Join);
+        }
+        return None;
+    }
+    let list_y = local_y - f64::from(WIFI_HEADER + WIFI_STATUS);
+    if list_y < 0.0 {
+        return None;
+    }
+    let row = (list_y / f64::from(WIFI_ROW)) as usize;
+    if row >= WIFI_VISIBLE as usize {
+        return None;
+    }
+    let index = scroll.max(0) as usize + row;
+    if index >= count {
+        return None;
+    }
+    if local_x >= f64::from(WIFI_W - 36) {
+        Some(WifiHit::Disconnect(index))
+    } else {
+        Some(WifiHit::Row(index))
+    }
+}
+
+pub fn paint_wifi_panel(rows: &[WifiPaint<'_>], scroll: i32, radio_on: Option<bool>, status: &str, password: Option<&str>) -> Vec<u8> {
+    let mut pixels = vec![0u8; (WIFI_W * WIFI_H * 4) as usize];
+    fill_rect(&mut pixels, WIFI_W, WIFI_H, 0, 0, WIFI_W, WIFI_H, 22, 24, 29);
+    draw_text8(&mut pixels, WIFI_W, 8, 12, "Wi-Fi", 230, 226, 216, WIFI_W);
+    draw_text8(&mut pixels, WIFI_W, 78, 12, "Scan", 215, 196, 163, WIFI_W);
+    let radio = match radio_on {
+        Some(true) => "On",
+        Some(false) => "Off",
+        None => "--",
+    };
+    draw_text8(&mut pixels, WIFI_W, WIFI_W - 40, 12, radio, 230, 226, 216, WIFI_W);
+    draw_text8(&mut pixels, WIFI_W, 8, WIFI_HEADER + 4, status, 180, 176, 166, WIFI_W);
+    let scroll = scroll.max(0) as usize;
+    for slot in 0..WIFI_VISIBLE as usize {
+        let Some(row) = rows.get(scroll + slot) else {
+            break;
+        };
+        let y = WIFI_HEADER + WIFI_STATUS + slot as i32 * WIFI_ROW;
+        if row.connected {
+            fill_rect(&mut pixels, WIFI_W, WIFI_H, 0, y, 3, WIFI_ROW, 215, 196, 163);
+        }
+        signal_bars(&mut pixels, 8, y + 8, row.signal);
+        let mut name = row.name.to_string();
+        if row.secured {
+            name.insert_str(0, "* ");
+        }
+        draw_text8(&mut pixels, WIFI_W, 32, y + 10, &name, 230, 226, 216, WIFI_W - 36);
+        if row.connected {
+            draw_text8(&mut pixels, WIFI_W, WIFI_W - 28, y + 10, "x", 215, 196, 163, WIFI_W);
+        }
+    }
+    let pass_y = WIFI_H - WIFI_PASS;
+    fill_rect(&mut pixels, WIFI_W, WIFI_H, 0, pass_y, WIFI_W, WIFI_PASS, 42, 45, 54);
+    if let Some(secret) = password {
+        if secret.is_empty() {
+            draw_text8(&mut pixels, WIFI_W, 8, pass_y + 12, "Password", 140, 136, 128, WIFI_W - 64);
+        } else {
+            let mut shown = String::new();
+            for _ in secret.chars().take(24) {
+                shown.push('•');
+            }
+            draw_text8(&mut pixels, WIFI_W, 8, pass_y + 12, &shown, 230, 226, 216, WIFI_W - 64);
+        }
+        draw_text8(&mut pixels, WIFI_W, WIFI_W - 48, pass_y + 12, "Join", 215, 196, 163, WIFI_W);
+    }
+    pixels
+}
+
+fn signal_bars(buf: &mut [u8], x: i32, y: i32, signal: u8) {
+    let level = (u16::from(signal) * 4 / 100).min(4) as i32;
+    for index in 0..4 {
+        let height = 4 + index * 3;
+        let (r, g, b) = if index < level { (215, 196, 163) } else { (50, 54, 62) };
+        fill_rect(buf, WIFI_W, WIFI_H, x + index * 5, y + 14 - height, 3, height, r, g, b);
+    }
+}
+
+fn draw_text8(buf: &mut [u8], width: i32, x: i32, y: i32, text: &str, r: u8, g: u8, b: u8, limit: i32) {
+    let mut cursor = x;
+    for ch in text.chars() {
+        if cursor + 8 > limit {
+            break;
+        }
+        if let Some(rows) = glyph8(ch) {
+            for (row, bits) in rows.iter().enumerate() {
+                for col in 0..8 {
+                    if bits & (1 << col) != 0 {
+                        put(buf, width, cursor + col, y + row as i32, r, g, b);
+                    }
+                }
+            }
+        }
+        cursor += 9;
+    }
+}
+
+fn glyph8(ch: char) -> Option<[u8; 8]> {
+    let code = ch as u32;
+    if code < 128 {
+        return Some(crate::font8x8::BASIC[code as usize]);
+    }
+    if (0xA0..=0xFF).contains(&code) {
+        return Some(crate::font8x8::LATIN[(code - 0xA0) as usize]);
+    }
+    if ch == '•' {
+        return Some([0x00, 0x18, 0x3C, 0x3C, 0x3C, 0x18, 0x00, 0x00]);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +573,7 @@ mod tests {
     fn collapsed_strip_ignores_clicks_past_the_icons() {
         assert_eq!(hit_strip(false, 600, 10.0, 10.0), Some(Entry::Start));
         assert_eq!(hit_strip(false, 600, 10.0, 60.0), Some(Entry::Browser));
+        assert_eq!(hit_strip(false, 600, 10.0, 520.0), Some(Entry::Network));
         assert_eq!(hit_strip(false, 600, 10.0, 580.0), Some(Entry::Power));
         assert_eq!(hit_strip(false, 600, 49.0, 10.0), None);
         assert_eq!(hit_strip(true, 600, 180.0, 60.0), Some(Entry::Browser));
@@ -397,7 +597,7 @@ mod tests {
 
     #[test]
     fn strip_buffer_covers_the_panel() {
-        let buf = paint_strip(STRIP_COLLAPSED, 100, false, Page::Start, false);
+        let buf = paint_strip(STRIP_COLLAPSED, 100, false, Page::Start, false, false);
         assert_eq!(buf.len(), (STRIP_COLLAPSED * 100 * 4) as usize);
     }
 
@@ -430,7 +630,7 @@ mod tests {
 
     #[test]
     fn start_and_browser_icons_differ_and_are_antialiased() {
-        let buf = paint_strip(STRIP_COLLAPSED, 600, false, Page::Start, false);
+        let buf = paint_strip(STRIP_COLLAPSED, 600, false, Page::Start, false, false);
         let start = ((24 * STRIP_COLLAPSED + 24) * 4) as usize;
         let browser = ((72 * STRIP_COLLAPSED + 24) * 4) as usize;
         assert_ne!(&buf[start..start + 3], &buf[browser..browser + 3]);
@@ -441,5 +641,44 @@ mod tests {
             menu[start..start + (MENU_W * 4) as usize].to_vec()
         };
         assert_ne!(row(20), row(68));
+    }
+
+    #[test]
+    fn wifi_panel_hits_toggle_scan_row_and_join() {
+        let (x, y) = wifi_origin(600);
+        assert_eq!(hit_wifi(600, f64::from(x + WIFI_W - 20), f64::from(y + 10), 3, 0), Some(WifiHit::Toggle));
+        assert_eq!(hit_wifi(600, f64::from(x + 80), f64::from(y + 10), 3, 0), Some(WifiHit::Scan));
+        let list_y = y + WIFI_HEADER + WIFI_STATUS + 4;
+        assert_eq!(hit_wifi(600, f64::from(x + 40), f64::from(list_y), 3, 0), Some(WifiHit::Row(0)));
+        assert_eq!(
+            hit_wifi(600, f64::from(x + WIFI_W - 10), f64::from(list_y + WIFI_ROW), 3, 1),
+            Some(WifiHit::Disconnect(2))
+        );
+        assert_eq!(
+            hit_wifi(600, f64::from(x + WIFI_W - 20), f64::from(y + WIFI_H - 10), 3, 0),
+            Some(WifiHit::Join)
+        );
+        assert_eq!(clamp_wifi_scroll(-2, 10), 0);
+        assert_eq!(clamp_wifi_scroll(9, 8), 2);
+        let panel = paint_wifi_panel(
+            &[WifiPaint { name: "Cafe", signal: 80, secured: true, connected: false }],
+            0,
+            Some(true),
+            "1 networks",
+            Some("secret"),
+        );
+        assert_eq!(panel.len(), (WIFI_W * WIFI_H * 4) as usize);
+        let long = "A".repeat(40);
+        let named = paint_wifi_panel(
+            &[WifiPaint { name: &long, signal: 80, secured: false, connected: false }],
+            0,
+            Some(true),
+            "ok",
+            None,
+        );
+        let drawn = ((68 * WIFI_W + 34) * 4) as usize;
+        assert_eq!(&named[drawn..drawn + 3], &[216, 226, 230]);
+        let kept = ((59 * WIFI_W + 14) * 4) as usize;
+        assert_eq!(&named[kept..kept + 3], &[29, 24, 22]);
     }
 }

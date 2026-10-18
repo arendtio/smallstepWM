@@ -56,7 +56,7 @@ pub struct Gpu {
     pub damage: OutputDamageTracker,
     pub background: MemoryRenderBuffer,
     pub strip: MemoryRenderBuffer,
-    pub strip_key: (bool, Page, bool, i32, i32),
+    pub strip_key: (bool, Page, bool, bool, i32, i32),
     pub power_menu: MemoryRenderBuffer,
     pub cursor: MemoryRenderBuffer,
     pub cursor_hot: (i32, i32),
@@ -79,6 +79,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let socket_name = listen(&mut event_loop, &mut display)?;
     let mut state = State::new(&mut display, socket_name);
     state.loop_handle = Some(event_loop.handle());
+    let (wifi_tx, wifi_channel) = smithay::reexports::calloop::channel::channel();
+    state.wifi_tx = Some(wifi_tx);
+    event_loop
+        .handle()
+        .insert_source(wifi_channel, |event, _, state| {
+            if let smithay::reexports::calloop::channel::Event::Msg(report) = event {
+                state.apply_wifi(report);
+            }
+        })
+        .map_err(|err| err.to_string())?;
     // SAFETY: the display source lives as long as the loop, and dispatch does not drop it.
     event_loop
         .handle()
@@ -223,7 +233,7 @@ fn open_gpu(
     let buffers = alloc_scan_buffers(&fd, (u32::from(width), u32::from(height)))?;
     let damage = OutputDamageTracker::from_output(&output);
     let background = background_buffer(state.output_size.w, state.output_size.h);
-    let strip = strip_buffer(state.output_size.h, false, Page::Start, false);
+    let strip = strip_buffer(state.output_size.h, false, Page::Start, false, false);
     let (cursor, cursor_hot) = cursor_buffer();
     Ok(Gpu {
         renderer,
@@ -233,7 +243,7 @@ fn open_gpu(
         damage,
         background,
         strip,
-        strip_key: (false, Page::Start, false, state.output_size.w, state.output_size.h),
+        strip_key: (false, Page::Start, false, false, state.output_size.w, state.output_size.h),
         power_menu: power_menu_buffer(),
         cursor,
         cursor_hot,
@@ -336,11 +346,35 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         None
     };
     let power_menu = state.power_menu;
+    let network_open = state.wifi.open;
+    let wifi_pixels = if network_open {
+        let rows: Vec<shell::WifiPaint<'_>> = state
+            .wifi
+            .networks
+            .iter()
+            .map(|net| shell::WifiPaint {
+                name: &net.ssid,
+                signal: net.signal,
+                secured: net.secured,
+                connected: net.connected,
+            })
+            .collect();
+        let password = state.wifi.password_for.as_ref().map(|_| state.wifi.password.as_str());
+        Some(shell::paint_wifi_panel(
+            &rows,
+            state.wifi.scroll,
+            state.wifi.radio_on,
+            &state.wifi.note,
+            password,
+        ))
+    } else {
+        None
+    };
 
     let gpu = state.gpu.as_mut().ok_or("no gpu")?;
-    if gpu.strip_key != (expanded, page, power_menu, size.w, size.h) {
-        gpu.strip = strip_buffer(size.h, expanded, page, power_menu);
-        gpu.strip_key = (expanded, page, power_menu, size.w, size.h);
+    if gpu.strip_key != (expanded, page, network_open, power_menu, size.w, size.h) {
+        gpu.strip = strip_buffer(size.h, expanded, page, network_open, power_menu);
+        gpu.strip_key = (expanded, page, network_open, power_menu, size.w, size.h);
     }
 
     let mut elements: Vec<ShellElement<PixmanRenderer>> = Vec::new();
@@ -372,6 +406,29 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         )
         .map_err(|err| err.to_string())?,
     ));
+    if let Some(pixels) = &wifi_pixels {
+        let (x, y) = shell::wifi_origin(size.h);
+        let panel = MemoryRenderBuffer::from_slice(
+            pixels,
+            Fourcc::Argb8888,
+            (shell::WIFI_W, shell::WIFI_H),
+            1,
+            Transform::Normal,
+            None,
+        );
+        elements.push(ShellElement::Memory(
+            MemoryRenderBufferRenderElement::from_buffer(
+                &mut gpu.renderer,
+                (f64::from(x), f64::from(y)),
+                &panel,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            )
+            .map_err(|err| err.to_string())?,
+        ));
+    }
     if power_menu {
         let (x, y) = shell::power_menu_origin(size.h);
         elements.push(ShellElement::Memory(
@@ -439,7 +496,7 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         .map_err(|err| err.to_string())?,
     ));
 
-    // Front to back: cursor, strip, power menu, startup bar, window, then the gradient.
+    // Front to back: cursor, strip, Wi-Fi panel, power menu, startup bar, window, then the gradient.
     let index = gpu.displayed.map(|shown| (shown + 1) % gpu.buffers.len()).unwrap_or(0);
     paint_scanout(gpu, index, &elements)?;
     present(gpu, index)
@@ -573,9 +630,9 @@ fn configure_pointer_scroll(device: &mut InputDevice) {
     tracing::info!(name = device.name(), ?chosen, ?methods, "scroll method");
 }
 
-fn strip_buffer(height: i32, expanded: bool, page: Page, power_open: bool) -> MemoryRenderBuffer {
+fn strip_buffer(height: i32, expanded: bool, page: Page, network_open: bool, power_open: bool) -> MemoryRenderBuffer {
     let width = shell::strip_width(expanded);
-    let pixels = shell::paint_strip(width, height, expanded, page, power_open);
+    let pixels = shell::paint_strip(width, height, expanded, page, network_open, power_open);
     MemoryRenderBuffer::from_slice(
         &pixels,
         Fourcc::Xrgb8888,

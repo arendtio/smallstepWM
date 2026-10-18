@@ -9,7 +9,8 @@ Source: assets/src/cursor.svg
 
 Icons
 
-House and globe are from Lucide (not in the Feather set).
+House, globe, and wifi are from Lucide (not in the Feather set).
+The wifi mark is in assets/src/wifi.svg.
 Copyright (c) 2026 Lucide Icons and Contributors.
 License: ISC.
 
@@ -19,6 +20,9 @@ License: MIT.
 
 The ISC and MIT notices are below. The rounded plates behind the strip icons
 are part of this project and use the same license as the shell, GPL-3.0-or-later.
+
+Network names use an 8x8 bitmap font in src/font8x8.rs.
+Those glyphs are public domain (Daniel Hepper, based on the IBM VGA font).
 
 ISC License
 

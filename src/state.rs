@@ -5,7 +5,7 @@ use smithay::{
     input::{Seat, SeatState, keyboard::XkbConfig},
     output::Output,
     reexports::{
-        calloop::LoopHandle,
+        calloop::{channel::Sender, LoopHandle},
         wayland_server::{
             DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason},
@@ -21,7 +21,7 @@ use smithay::{
     },
 };
 
-use crate::{keyboard, shell::Page};
+use crate::{keyboard, shell::Page, wifi};
 
 pub struct State {
     pub display_handle: DisplayHandle,
@@ -47,6 +47,8 @@ pub struct State {
     pub strip_expanded: bool,
     pub page: Page,
     pub power_menu: bool,
+    pub wifi: wifi::Panel,
+    pub wifi_tx: Option<Sender<wifi::WifiReport>>,
     pub browser_launched: bool,
     pub browser_starting: Option<Instant>,
     pub startup_timer: bool,
@@ -118,6 +120,8 @@ impl State {
             strip_expanded: false,
             page: Page::Start,
             power_menu: false,
+            wifi: wifi::Panel::default(),
+            wifi_tx: None,
             browser_launched: false,
             browser_starting: None,
             startup_timer: false,
