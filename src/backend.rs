@@ -1,40 +1,54 @@
 use std::time::Duration;
 
 use smithay::{
-    reexports::input::Device as InputDevice,
     backend::{
-        allocator::Fourcc,
-        drm::{DrmDevice, DrmDeviceFd, DrmEvent},
+        allocator::{
+            Format, Fourcc, Modifier,
+            dmabuf::{AsDmabuf, Dmabuf},
+            gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
+        },
+        drm::{
+            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode,
+            gbm::{GbmFramebuffer, framebuffer_from_bo},
+        },
+        egl::{
+            EGLContext, EGLDevice, EGLDisplay,
+            context::{GlAttributes, PixelFormatRequirements},
+        },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            Bind, Color32F, ImportAll, ImportMem,
+            Bind, Color32F, ImportAll, ImportDma, ImportMem, Renderer,
             damage::OutputDamageTracker,
             element::{
                 AsRenderElements, Kind,
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
                 surface::WaylandSurfaceRenderElement,
             },
+            gles::GlesRenderer,
             pixman::PixmanRenderer,
         },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev,
     },
+    desktop::Window,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
-        calloop::{EventLoop, Interest, LoopHandle, Mode as CalloopMode, PostAction, generic::Generic},
+        calloop::{
+            EventLoop, Interest, LoopHandle, Mode as CalloopMode, PostAction, generic::Generic,
+        },
         drm::{
             buffer::Buffer as DrmBuffer,
             control::{
-                self, Device as ControlDevice, ModeTypeFlags, PageFlipFlags, connector, crtc, dumbbuffer,
-                framebuffer,
+                self, Device as ControlDevice, ModeTypeFlags, PageFlipFlags, connector, crtc,
+                dumbbuffer, framebuffer,
             },
         },
-        input::Libinput,
+        input::{Device as InputDevice, Libinput},
         pixman,
         rustix::fs::OFlags,
         wayland_server::Display,
     },
-    utils::{DeviceFd, Point, Scale, Transform},
+    utils::{DeviceFd, Logical, Point, Scale, Transform},
     wayland::socket::ListeningSocketSource,
 };
 
@@ -48,11 +62,32 @@ use crate::{
     state::{ClientState, State},
 };
 
+enum Engine {
+    Soft {
+        renderer: PixmanRenderer,
+        buffers: Vec<ScanBuffer>,
+    },
+    Gl {
+        renderer: GlesRenderer,
+        buffers: Vec<GlScan>,
+        // The buffer objects borrow the GBM device, so it has to outlive them.
+        // Fields drop in declaration order: renderer, then buffers, then this.
+        _allocator: GbmAllocator<DrmDeviceFd>,
+    },
+}
+
+struct GlScan {
+    handle: framebuffer::Handle,
+    // Dropped before the buffer object. The handle above is only a copy.
+    _fb: GbmFramebuffer,
+    dmabuf: Dmabuf,
+    _bo: GbmBuffer,
+}
+
 pub struct Gpu {
-    pub renderer: PixmanRenderer,
+    engine: Engine,
     pub drm: DrmDevice,
     pub fd: DrmDeviceFd,
-    pub buffers: Vec<ScanBuffer>,
     pub damage: OutputDamageTracker,
     pub background: MemoryRenderBuffer,
     pub strip: MemoryRenderBuffer,
@@ -65,6 +100,48 @@ pub struct Gpu {
     pub mode: control::Mode,
     pub displayed: Option<usize>,
     pub pending: Option<usize>,
+}
+
+impl Gpu {
+    pub(crate) fn import_client_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
+        let Engine::Gl { renderer, .. } = &mut self.engine else {
+            return false;
+        };
+        renderer.import_dmabuf(dmabuf, None).is_ok()
+    }
+
+    fn is_accelerated(&self) -> bool {
+        matches!(self.engine, Engine::Gl { .. })
+    }
+
+    fn dmabuf_formats(&self) -> Vec<Format> {
+        let Engine::Gl { renderer, .. } = &self.engine else {
+            return Vec::new();
+        };
+        renderer.dmabuf_formats().iter().copied().collect()
+    }
+
+    fn buffer_count(&self) -> usize {
+        match &self.engine {
+            Engine::Soft { buffers, .. } => buffers.len(),
+            Engine::Gl { buffers, .. } => buffers.len(),
+        }
+    }
+
+    fn framebuffer(&self, index: usize) -> framebuffer::Handle {
+        match &self.engine {
+            Engine::Soft { buffers, .. } => buffers[index].fb,
+            Engine::Gl { buffers, .. } => buffers[index].handle,
+        }
+    }
+
+    fn replace_with_software(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let (width, height) = self.mode.size();
+        self.engine = software_engine(&self.fd, (u32::from(width), u32::from(height)))?;
+        self.displayed = None;
+        self.pending = None;
+        Ok(())
+    }
 }
 
 smithay::backend::renderer::element::render_elements! {
@@ -132,8 +209,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!(socket = ?state.socket_name, "session ready");
 
-    pump(&mut state)?;
-    if state.gpu.as_ref().is_some_and(|gpu| gpu.displayed.is_none()) {
+    let accelerated = state.gpu.as_ref().is_some_and(|gpu| gpu.is_accelerated());
+    if let Err(err) = pump(&mut state) {
+        if !accelerated {
+            return Err(err);
+        }
+        tracing::warn!(%err, "OpenGL ES frame failed, using software rendering");
+        fallback_to_software(&mut state)?;
+        pump(&mut state)?;
+    } else if accelerated
+        && state
+            .gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.displayed.is_none())
+    {
+        tracing::warn!("OpenGL ES did not show a frame, using software rendering");
+        fallback_to_software(&mut state)?;
+        pump(&mut state)?;
+    }
+    if state
+        .gpu
+        .as_ref()
+        .is_some_and(|gpu| gpu.displayed.is_none())
+    {
         return Err("the first frame was not shown".into());
     }
     event_loop.run(None, &mut state, |state| {
@@ -173,20 +271,22 @@ fn open_gpu(
     let seat_name = session.seat();
     let path = udev::primary_gpu(&seat_name)?.ok_or("no DRM device on this seat")?;
 
-    let mut libinput = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
+    let mut libinput =
+        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
     libinput
         .udev_assign_seat(&seat_name)
         .map_err(|_| "failed to assign the libinput seat")?;
     let libinput_saved = libinput.clone();
     handle
-        .insert_source(LibinputInputBackend::new(libinput), |event, _, state| {
-            match event {
+        .insert_source(
+            LibinputInputBackend::new(libinput),
+            |event, _, state| match event {
                 smithay::backend::input::InputEvent::DeviceAdded { mut device } => {
                     configure_pointer_scroll(&mut device);
                 }
                 other => state.on_input(other),
-            }
-        })
+            },
+        )
         .map_err(|err| err.to_string())?;
 
     let mut libinput_for_session = libinput_saved.clone();
@@ -218,7 +318,10 @@ fn open_gpu(
         .map_err(|err| err.to_string())?;
 
     let fd = session
-        .open(&path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK)
+        .open(
+            &path,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+        )
         .map_err(|err| err.to_string())?;
     let fd = DrmDeviceFd::new(DeviceFd::from(fd));
     let (drm, drm_notifier) = DrmDevice::new(fd.clone(), true)?;
@@ -242,24 +345,48 @@ fn open_gpu(
         },
     );
     let _global = output.create_global::<State>(&state.display_handle);
-    output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
     output.set_preferred(mode);
     state.space.map_output(&output, (0, 0));
     state.output_size = mode.size.to_logical(1);
     state.output = Some(output.clone());
 
-    let renderer = PixmanRenderer::new().map_err(|err| err.to_string())?;
     let (width, height) = picked.mode.size();
-    let buffers = alloc_scan_buffers(&fd, (u32::from(width), u32::from(height)))?;
+    let size = (u32::from(width), u32::from(height));
+    let engine = if hardware_requested(std::env::var("SMALLSTEP_RENDERER").ok().as_deref()) {
+        match try_accelerated(&fd, size) {
+            Ok(engine) => engine,
+            Err(err) => {
+                tracing::warn!(reason = %err, "OpenGL ES unavailable, using software rendering");
+                software_engine(&fd, size)?
+            }
+        }
+    } else {
+        tracing::warn!("using software rendering");
+        software_engine(&fd, size)?
+    };
     let damage = OutputDamageTracker::from_output(&output);
     let background = background_buffer(state.output_size.w, state.output_size.h);
-    let strip = strip_buffer(state.output_size.h, false, Page::Start, false, false, false, &[], 0);
+    let strip = strip_buffer(
+        state.output_size.h,
+        false,
+        Page::Start,
+        false,
+        false,
+        false,
+        &[],
+        0,
+    );
     let (cursor, cursor_hot) = cursor_buffer();
-    Ok(Gpu {
-        renderer,
+    let gpu = Gpu {
+        engine,
         drm,
         fd,
-        buffers,
         damage,
         background,
         strip,
@@ -281,10 +408,26 @@ fn open_gpu(
         mode: picked.mode,
         displayed: None,
         pending: None,
-    })
+    };
+    if gpu.is_accelerated() {
+        let formats = gpu.dmabuf_formats();
+        let count = formats.len();
+        if count > 0 {
+            state.dmabuf_global = Some(
+                state
+                    .dmabuf_state
+                    .create_global::<State>(&state.display_handle, formats),
+            );
+        }
+        tracing::warn!(dmabuf_formats = count, "using OpenGL ES");
+    }
+    Ok(gpu)
 }
 
-fn alloc_scan_buffers(fd: &DrmDeviceFd, size: (u32, u32)) -> Result<Vec<ScanBuffer>, Box<dyn std::error::Error>> {
+fn alloc_scan_buffers(
+    fd: &DrmDeviceFd,
+    size: (u32, u32),
+) -> Result<Vec<ScanBuffer>, Box<dyn std::error::Error>> {
     let mut buffers = Vec::new();
     for index in 0..2 {
         match alloc_scan_buffer(fd, size) {
@@ -326,7 +469,9 @@ fn on_vblank(state: &mut State, crtc: crtc::Handle) {
     if let Some(output) = state.output.clone() {
         let time = state.start.elapsed();
         for window in state.space.elements() {
-            window.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
+            window.send_frame(&output, time, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
         }
     }
     state.space.refresh();
@@ -387,13 +532,18 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         None
     };
     let voice_note = hud_text.as_deref().map(shell::paint_voice_note);
-    let labels: Vec<String> = state.pages.iter().map(|page| crate::pages::label(&page.title, &page.url)).collect();
+    let labels: Vec<String> = state
+        .pages
+        .iter()
+        .map(|page| crate::pages::label(&page.title, &page.url))
+        .collect();
     let page_rows: Vec<shell::StripPage<'_>> = labels
         .iter()
         .enumerate()
         .map(|(index, label)| shell::StripPage {
             label,
-            active: page == Page::Browser && state.active_context.as_deref() == Some(state.pages[index].context.as_str()),
+            active: page == Page::Browser
+                && state.active_context.as_deref() == Some(state.pages[index].context.as_str()),
         })
         .collect();
     let page_scroll = state.page_scroll;
@@ -410,7 +560,11 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
                 connected: net.connected,
             })
             .collect();
-        let password = state.wifi.password_for.as_ref().map(|_| state.wifi.password.as_str());
+        let password = state
+            .wifi
+            .password_for
+            .as_ref()
+            .map(|_| state.wifi.password.as_str());
         Some(shell::paint_wifi_panel(
             &rows,
             state.wifi.scroll,
@@ -423,21 +577,143 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
     };
 
     let gpu = state.gpu.as_mut().ok_or("no gpu")?;
-    if gpu.strip_key != (expanded, page, network_open, power_menu, voice_live, size.w, size.h, strip_stamp) {
-        gpu.strip = strip_buffer(size.h, expanded, page, network_open, power_menu, voice_live, &page_rows, page_scroll);
-        gpu.strip_key = (expanded, page, network_open, power_menu, voice_live, size.w, size.h, strip_stamp);
+    if gpu.strip_key
+        != (
+            expanded,
+            page,
+            network_open,
+            power_menu,
+            voice_live,
+            size.w,
+            size.h,
+            strip_stamp,
+        )
+    {
+        gpu.strip = strip_buffer(
+            size.h,
+            expanded,
+            page,
+            network_open,
+            power_menu,
+            voice_live,
+            &page_rows,
+            page_scroll,
+        );
+        gpu.strip_key = (
+            expanded,
+            page,
+            network_open,
+            power_menu,
+            voice_live,
+            size.w,
+            size.h,
+            strip_stamp,
+        );
     }
 
-    let mut elements: Vec<ShellElement<PixmanRenderer>> = Vec::new();
+    let decor = Decor {
+        pointer,
+        page,
+        power_open: power_menu,
+        size_w: size.w,
+        size_h: size.h,
+        startup,
+        voice_note,
+        wifi_pixels,
+        windows,
+    };
+    let index = gpu
+        .displayed
+        .map(|shown| (shown + 1) % gpu.buffer_count())
+        .unwrap_or(0);
+    // Front to back: cursor, strip, Wi-Fi panel, power menu, startup bar, window, then the gradient.
+    render_into(gpu, index, &decor)?;
+    present(gpu, index)
+}
+
+fn render_into(
+    gpu: &mut Gpu,
+    index: usize,
+    decor: &Decor,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Gpu {
+        engine,
+        damage,
+        cursor,
+        cursor_hot,
+        strip,
+        background,
+        power_menu,
+        fd,
+        ..
+    } = gpu;
+    match engine {
+        Engine::Soft { renderer, buffers } => {
+            let elements = compose(
+                renderer,
+                cursor,
+                *cursor_hot,
+                strip,
+                background,
+                power_menu,
+                decor,
+            )?;
+            paint_soft(renderer, damage, fd, &mut buffers[index], &elements)?;
+        }
+        Engine::Gl {
+            renderer, buffers, ..
+        } => {
+            let elements = compose(
+                renderer,
+                cursor,
+                *cursor_hot,
+                strip,
+                background,
+                power_menu,
+                decor,
+            )?;
+            paint_gl(renderer, damage, &buffers[index], &elements)?;
+        }
+    }
+    Ok(())
+}
+
+struct Decor {
+    pointer: Point<f64, Logical>,
+    page: Page,
+    power_open: bool,
+    size_w: i32,
+    size_h: i32,
+    startup: Option<f32>,
+    voice_note: Option<(Vec<u8>, i32, i32)>,
+    wifi_pixels: Option<Vec<u8>>,
+    windows: Vec<(Window, Point<i32, Logical>)>,
+}
+
+fn compose<R>(
+    renderer: &mut R,
+    cursor: &MemoryRenderBuffer,
+    cursor_hot: (i32, i32),
+    strip: &MemoryRenderBuffer,
+    background: &MemoryRenderBuffer,
+    power_menu: &MemoryRenderBuffer,
+    decor: &Decor,
+) -> Result<Vec<ShellElement<R>>, String>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: smithay::backend::renderer::Texture + Send + Clone + 'static,
+    R::Error: std::error::Error,
+{
+    let mut elements: Vec<ShellElement<R>> = Vec::new();
     let cursor_at = (
-        pointer.x as i32 - gpu.cursor_hot.0,
-        pointer.y as i32 - gpu.cursor_hot.1,
+        decor.pointer.x as i32 - cursor_hot.0,
+        decor.pointer.y as i32 - cursor_hot.1,
     );
     elements.push(ShellElement::Memory(
         MemoryRenderBufferRenderElement::from_buffer(
-            &mut gpu.renderer,
+            renderer,
             (f64::from(cursor_at.0), f64::from(cursor_at.1)),
-            &gpu.cursor,
+            cursor,
             None,
             None,
             None,
@@ -447,9 +723,9 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
     ));
     elements.push(ShellElement::Memory(
         MemoryRenderBufferRenderElement::from_buffer(
-            &mut gpu.renderer,
+            renderer,
             (0.0, 0.0),
-            &gpu.strip,
+            strip,
             None,
             None,
             None,
@@ -457,7 +733,7 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         )
         .map_err(|err| err.to_string())?,
     ));
-    if let Some((pixels, width, height)) = &voice_note {
+    if let Some((pixels, width, height)) = &decor.voice_note {
         let note = MemoryRenderBuffer::from_slice(
             pixels,
             Fourcc::Argb8888,
@@ -468,7 +744,7 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         );
         elements.push(ShellElement::Memory(
             MemoryRenderBufferRenderElement::from_buffer(
-                &mut gpu.renderer,
+                renderer,
                 (f64::from(shell::STRIP_COLLAPSED + 8), 8.0),
                 &note,
                 None,
@@ -479,8 +755,8 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
             .map_err(|err| err.to_string())?,
         ));
     }
-    if let Some(pixels) = &wifi_pixels {
-        let (x, y) = shell::wifi_origin(size.h);
+    if let Some(pixels) = &decor.wifi_pixels {
+        let (x, y) = shell::wifi_origin(decor.size_h);
         let panel = MemoryRenderBuffer::from_slice(
             pixels,
             Fourcc::Argb8888,
@@ -491,7 +767,7 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         );
         elements.push(ShellElement::Memory(
             MemoryRenderBufferRenderElement::from_buffer(
-                &mut gpu.renderer,
+                renderer,
                 (f64::from(x), f64::from(y)),
                 &panel,
                 None,
@@ -502,13 +778,13 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
             .map_err(|err| err.to_string())?,
         ));
     }
-    if power_menu {
-        let (x, y) = shell::power_menu_origin(size.h);
+    if decor.power_open {
+        let (x, y) = shell::power_menu_origin(decor.size_h);
         elements.push(ShellElement::Memory(
             MemoryRenderBufferRenderElement::from_buffer(
-                &mut gpu.renderer,
+                renderer,
                 (f64::from(x), f64::from(y)),
-                &gpu.power_menu,
+                power_menu,
                 None,
                 None,
                 None,
@@ -517,7 +793,7 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
             .map_err(|err| err.to_string())?,
         ));
     }
-    if let Some(phase) = startup {
+    if let Some(phase) = decor.startup {
         let pixels = shell::paint_startup_bar(phase);
         let bar = MemoryRenderBuffer::from_slice(
             &pixels,
@@ -527,12 +803,12 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
             Transform::Normal,
             None,
         );
-        let content_w = (size.w - shell::STRIP_COLLAPSED).max(1);
+        let content_w = (decor.size_w - shell::STRIP_COLLAPSED).max(1);
         let x = shell::STRIP_COLLAPSED + (content_w - shell::BAR_W) / 2;
-        let y = (size.h - shell::BAR_H) / 2;
+        let y = (decor.size_h - shell::BAR_H) / 2;
         elements.push(ShellElement::Memory(
             MemoryRenderBufferRenderElement::from_buffer(
-                &mut gpu.renderer,
+                renderer,
                 (f64::from(x), f64::from(y)),
                 &bar,
                 None,
@@ -544,23 +820,18 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         ));
     }
 
-    if page == Page::Browser {
-        if let Some((window, loc)) = windows.last() {
+    if decor.page == Page::Browser {
+        if let Some((window, loc)) = decor.windows.last() {
             let at = Point::<i32, smithay::utils::Physical>::from((loc.x, loc.y));
-            elements.extend(window.render_elements(
-                &mut gpu.renderer,
-                at,
-                Scale::from(1.0),
-                1.0,
-            ));
+            elements.extend(window.render_elements(renderer, at, Scale::from(1.0), 1.0));
         }
     }
 
     elements.push(ShellElement::Memory(
         MemoryRenderBufferRenderElement::from_buffer(
-            &mut gpu.renderer,
+            renderer,
             (0.0, 0.0),
-            &gpu.background,
+            background,
             None,
             None,
             None,
@@ -568,27 +839,26 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         )
         .map_err(|err| err.to_string())?,
     ));
-
-    // Front to back: cursor, strip, Wi-Fi panel, power menu, startup bar, window, then the gradient.
-    let index = gpu.displayed.map(|shown| (shown + 1) % gpu.buffers.len()).unwrap_or(0);
-    paint_scanout(gpu, index, &elements)?;
-    present(gpu, index)
+    Ok(elements)
 }
 
-fn paint_scanout(
-    gpu: &mut Gpu,
-    index: usize,
+fn paint_soft(
+    renderer: &mut PixmanRenderer,
+    damage: &mut OutputDamageTracker,
+    fd: &DrmDeviceFd,
+    buffer: &mut ScanBuffer,
     elements: &[ShellElement<PixmanRenderer>],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (width, height) = DrmBuffer::size(&gpu.buffers[index].dumb);
-    let pitch = DrmBuffer::pitch(&gpu.buffers[index].dumb) as usize;
-    let mut mapping = gpu.fd.map_dumb_buffer(&mut gpu.buffers[index].dumb).map_err(|err| {
+    let (width, height) = DrmBuffer::size(&buffer.dumb);
+    let pitch = DrmBuffer::pitch(&buffer.dumb) as usize;
+    let mut mapping = fd.map_dumb_buffer(&mut buffer.dumb).map_err(|err| {
         format!(
             "mapping the dumb buffer failed: {err} (os error {:?})",
             err.raw_os_error()
         )
     })?;
-    let format = pixman::FormatCode::try_from(Fourcc::Xrgb8888).map_err(|_| "unsupported scanout format")?;
+    let format =
+        pixman::FormatCode::try_from(Fourcc::Xrgb8888).map_err(|_| "unsupported scanout format")?;
     // The mapping stays alive until this function returns, after the image is dropped.
     let mut image = unsafe {
         pixman::Image::from_raw_mut(
@@ -601,10 +871,10 @@ fn paint_scanout(
         )
     }
     .map_err(|_| "creating the scanout image failed")?;
-    let mut target = gpu.renderer.bind(&mut image).map_err(|err| err.to_string())?;
-    gpu.damage
+    let mut target = renderer.bind(&mut image).map_err(|err| err.to_string())?;
+    damage
         .render_output(
-            &mut gpu.renderer,
+            renderer,
             &mut target,
             0,
             elements,
@@ -617,12 +887,42 @@ fn paint_scanout(
     Ok(())
 }
 
+fn paint_gl(
+    renderer: &mut GlesRenderer,
+    damage: &mut OutputDamageTracker,
+    buffer: &GlScan,
+    elements: &[ShellElement<GlesRenderer>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut dmabuf = buffer.dmabuf.clone();
+    let mut target = renderer.bind(&mut dmabuf).map_err(|err| err.to_string())?;
+    damage
+        .render_output(
+            renderer,
+            &mut target,
+            0,
+            elements,
+            Color32F::new(0.08, 0.09, 0.11, 1.0),
+        )
+        .map_err(|err| err.to_string())?;
+    drop(target);
+    // The scanout buffer is a dma-buf. Finish so the display does not read it mid-draw.
+    renderer
+        .with_context(|gl| unsafe { gl.Finish() })
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 fn present(gpu: &mut Gpu, index: usize) -> Result<bool, Box<dyn std::error::Error>> {
-    let fb = gpu.buffers[index].fb;
-    if gpu.displayed.is_none() || gpu.buffers.len() == 1 {
+    let fb = gpu.framebuffer(index);
+    if gpu.displayed.is_none() || gpu.buffer_count() == 1 {
         gpu.fd
             .set_crtc(gpu.crtc, Some(fb), (0, 0), &[gpu.connector], Some(gpu.mode))
-            .map_err(|err| format!("setting the display mode failed: {err} (os error {:?})", err.raw_os_error()))?;
+            .map_err(|err| {
+                format!(
+                    "setting the display mode failed: {err} (os error {:?})",
+                    err.raw_os_error()
+                )
+            })?;
         gpu.displayed = Some(index);
         return Ok(false);
     }
@@ -638,7 +938,11 @@ fn present(gpu: &mut Gpu, index: usize) -> Result<bool, Box<dyn std::error::Erro
             gpu.displayed = Some(index);
             Ok(false)
         }
-        Err(err) => Err(format!("page flip failed: {err} (os error {:?})", err.raw_os_error()).into()),
+        Err(err) => Err(format!(
+            "page flip failed: {err} (os error {:?})",
+            err.raw_os_error()
+        )
+        .into()),
     }
 }
 
@@ -646,10 +950,182 @@ fn restore_scanout(gpu: &mut Gpu) -> Result<(), String> {
     let Some(index) = gpu.displayed else {
         return Ok(());
     };
-    let fb = gpu.buffers[index].fb;
+    let fb = gpu.framebuffer(index);
     gpu.fd
         .set_crtc(gpu.crtc, Some(fb), (0, 0), &[gpu.connector], Some(gpu.mode))
-        .map_err(|err| format!("setting the display mode failed: {err} (os error {:?})", err.raw_os_error()))
+        .map_err(|err| {
+            format!(
+                "setting the display mode failed: {err} (os error {:?})",
+                err.raw_os_error()
+            )
+        })
+}
+
+fn fallback_to_software(state: &mut State) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(global) = state.dmabuf_global.take() {
+        state
+            .dmabuf_state
+            .disable_global::<State>(&state.display_handle, &global);
+        state
+            .dmabuf_state
+            .destroy_global::<State>(&state.display_handle, global);
+    }
+    let gpu = state.gpu.as_mut().ok_or("no gpu")?;
+    gpu.replace_with_software()?;
+    state.dirty = true;
+    state.frame_pending = false;
+    Ok(())
+}
+
+fn software_engine(
+    fd: &DrmDeviceFd,
+    size: (u32, u32),
+) -> Result<Engine, Box<dyn std::error::Error>> {
+    let renderer = PixmanRenderer::new().map_err(|err| err.to_string())?;
+    let buffers = alloc_scan_buffers(fd, size)?;
+    Ok(Engine::Soft { renderer, buffers })
+}
+
+fn hardware_requested(value: Option<&str>) -> bool {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "software" | "soft" | "pixman"
+    )
+}
+
+fn same_gpu(seat_major: u32, seat_minor: u32, device_major: u32, device_minor: u32) -> bool {
+    seat_major == device_major && seat_minor % 64 == device_minor % 64
+}
+
+fn try_accelerated(fd: &DrmDeviceFd, size: (u32, u32)) -> Result<Engine, String> {
+    let seat = DrmNode::from_file(fd).map_err(|err| err.to_string())?;
+    let device = match_hardware_device(seat)?;
+    // The EGL device is a process-wide handle. Nothing else has made it current.
+    let display = unsafe { EGLDisplay::new(device) }.map_err(|err| err.to_string())?;
+    let context = egl_context(&display)?;
+    // This thread is still the only one, and the context is not current elsewhere.
+    let mut renderer = unsafe { GlesRenderer::new(context) }.map_err(|err| err.to_string())?;
+    let gbm = GbmDevice::new(fd.clone()).map_err(|err| err.to_string())?;
+    let mut allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let mut last = String::from("no scanout format");
+    for fourcc in [Fourcc::Argb8888, Fourcc::Xrgb8888] {
+        let buffers = match alloc_gl_buffers_format(&mut allocator, fd, size, fourcc) {
+            Ok(buffers) => buffers,
+            Err(err) => {
+                last = err;
+                continue;
+            }
+        };
+        let mut dmabuf = buffers[0].dmabuf.clone();
+        match renderer.bind(&mut dmabuf) {
+            Ok(target) => {
+                drop(target);
+                return Ok(Engine::Gl {
+                    renderer,
+                    buffers,
+                    _allocator: allocator,
+                });
+            }
+            Err(err) => last = err.to_string(),
+        }
+    }
+    Err(last)
+}
+
+fn match_hardware_device(seat: DrmNode) -> Result<EGLDevice, String> {
+    let devices = EGLDevice::enumerate().map_err(|err| err.to_string())?;
+    for device in devices {
+        if device.is_software() {
+            continue;
+        }
+        let Ok(Some(node)) = device.try_get_render_node() else {
+            continue;
+        };
+        if same_gpu(seat.major(), seat.minor(), node.major(), node.minor()) {
+            return Ok(device);
+        }
+    }
+    Err("no hardware EGL device for this seat".into())
+}
+
+fn egl_context(display: &EGLDisplay) -> Result<EGLContext, String> {
+    let reqs = PixelFormatRequirements {
+        hardware_accelerated: Some(true),
+        color_bits: Some(24),
+        float_color_buffer: false,
+        alpha_bits: None,
+        depth_bits: None,
+        stencil_bits: None,
+        multisampling: None,
+    };
+    let mut last = String::from("no GLES context");
+    for major in [3, 2] {
+        let attributes = GlAttributes {
+            version: (major, 0),
+            profile: None,
+            debug: false,
+            vsync: false,
+        };
+        match EGLContext::new_with_config(display, attributes, reqs) {
+            Ok(context) => return Ok(context),
+            Err(err) => last = err.to_string(),
+        }
+    }
+    Err(last)
+}
+
+fn alloc_gl_buffers_format(
+    allocator: &mut GbmAllocator<DrmDeviceFd>,
+    fd: &DrmDeviceFd,
+    size: (u32, u32),
+    fourcc: Fourcc,
+) -> Result<Vec<GlScan>, String> {
+    let modifiers = [Modifier::Linear, Modifier::Invalid];
+    let flags = GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT;
+    let mut buffers = Vec::new();
+    for index in 0..2 {
+        let bo = match allocator.create_buffer_with_flags(size.0, size.1, fourcc, &modifiers, flags)
+        {
+            Ok(bo) => bo,
+            Err(err) if index == 0 => return Err(format!("GBM buffer: {err}")),
+            Err(err) => {
+                tracing::warn!(%err, "second GLES scanout buffer unavailable");
+                break;
+            }
+        };
+        let dmabuf = match bo.export() {
+            Ok(dmabuf) => dmabuf,
+            Err(err) if index == 0 => {
+                return Err(format!("exporting the GBM buffer failed: {err}"));
+            }
+            Err(err) => {
+                tracing::warn!(%err, "second GLES scanout buffer unavailable");
+                break;
+            }
+        };
+        let fb = match framebuffer_from_bo(fd, &bo, true) {
+            Ok(fb) => fb,
+            Err(err) if index == 0 => return Err(format!("GBM framebuffer: {err}")),
+            Err(err) => {
+                tracing::warn!(%err, "second GLES scanout buffer unavailable");
+                break;
+            }
+        };
+        let handle = *fb.as_ref();
+        buffers.push(GlScan {
+            handle,
+            _fb: fb,
+            dmabuf,
+            _bo: bo,
+        });
+    }
+    if buffers.is_empty() {
+        return Err("no GLES scanout buffer".into());
+    }
+    Ok(buffers)
 }
 
 fn background_buffer(width: i32, height: i32) -> MemoryRenderBuffer {
@@ -714,7 +1190,17 @@ fn strip_buffer(
     scroll: i32,
 ) -> MemoryRenderBuffer {
     let width = shell::strip_width(expanded);
-    let pixels = shell::paint_strip(width, height, expanded, page, network_open, power_open, voice_live, pages, scroll);
+    let pixels = shell::paint_strip(
+        width,
+        height,
+        expanded,
+        page,
+        network_open,
+        power_open,
+        voice_live,
+        pages,
+        scroll,
+    );
     MemoryRenderBuffer::from_slice(
         &pixels,
         Fourcc::Xrgb8888,
@@ -784,7 +1270,11 @@ fn find_crtc(
         let Ok(encoder) = device.get_encoder(*enc_handle) else {
             continue;
         };
-        if let Some(crtc) = resources.filter_crtcs(encoder.possible_crtcs()).into_iter().next() {
+        if let Some(crtc) = resources
+            .filter_crtcs(encoder.possible_crtcs())
+            .into_iter()
+            .next()
+        {
             return Some(crtc);
         }
     }
@@ -796,6 +1286,40 @@ fn wl_mode(mode: &control::Mode) -> Mode {
     let refresh = mode.vrefresh();
     Mode {
         size: (i32::from(w), i32::from(h)).into(),
-        refresh: if refresh == 0 { 60_000 } else { (refresh as i32) * 1000 },
+        refresh: if refresh == 0 {
+            60_000
+        } else {
+            (refresh as i32) * 1000
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hardware_requested, same_gpu};
+
+    #[test]
+    fn software_names_force_the_cpu_path() {
+        assert!(!hardware_requested(Some("software")));
+        assert!(!hardware_requested(Some("soft")));
+        assert!(!hardware_requested(Some("pixman")));
+        assert!(!hardware_requested(Some(" Software ")));
+    }
+
+    #[test]
+    fn other_names_try_hardware() {
+        assert!(hardware_requested(None));
+        assert!(hardware_requested(Some("")));
+        assert!(hardware_requested(Some("auto")));
+        assert!(hardware_requested(Some("gl")));
+        assert!(hardware_requested(Some("egl")));
+    }
+
+    #[test]
+    fn primary_and_render_node_are_the_same_gpu() {
+        assert!(same_gpu(226, 0, 226, 128));
+        assert!(same_gpu(226, 1, 226, 129));
+        assert!(!same_gpu(226, 0, 226, 129));
+        assert!(!same_gpu(226, 0, 226, 1));
     }
 }

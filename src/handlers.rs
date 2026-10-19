@@ -1,4 +1,5 @@
 use smithay::{
+    backend::allocator::dmabuf::Dmabuf,
     desktop::{PopupKind, WindowSurfaceType, find_popup_root_surface, get_popup_toplevel_coords},
     input::{SeatHandler, SeatState},
     reexports::{
@@ -12,13 +13,16 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorHandler, CompositorState, get_parent, is_sync_subsurface,
-            with_states,
+            CompositorClientState, CompositorHandler, CompositorState, get_parent,
+            is_sync_subsurface, with_states,
         },
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::OutputHandler,
         selection::{
             SelectionHandler,
-            data_device::{ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler},
+            data_device::{
+                ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+            },
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -52,7 +56,11 @@ impl CompositorHandler for State {
             if let Some(window) = self
                 .space
                 .elements()
-                .find(|window| window.toplevel().is_some_and(|top| top.wl_surface() == &root))
+                .find(|window| {
+                    window
+                        .toplevel()
+                        .is_some_and(|top| top.wl_surface() == &root)
+                })
                 .cloned()
             {
                 window.on_commit();
@@ -62,7 +70,11 @@ impl CompositorHandler for State {
         if let Some(window) = self
             .space
             .elements()
-            .find(|window| window.toplevel().is_some_and(|top| top.wl_surface() == surface))
+            .find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|top| top.wl_surface() == surface)
+            })
             .cloned()
         {
             let initial = with_states(surface, |states| {
@@ -89,6 +101,31 @@ impl BufferHandler for State {
 impl ShmHandler for State {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
+    }
+}
+
+impl DmabufHandler for State {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        let imported = self
+            .gpu
+            .as_mut()
+            .is_some_and(|gpu| gpu.import_client_dmabuf(&dmabuf));
+        if imported {
+            if let Err(err) = notifier.successful::<Self>() {
+                tracing::warn!(?err, "dma-buf import could not be reported");
+            }
+        } else {
+            notifier.failed();
+        }
     }
 }
 
@@ -128,11 +165,11 @@ impl XdgShellHandler for State {
             state.positioner = positioner;
         });
         if let Some(root) = find_popup_root_surface(&PopupKind::Xdg(surface.clone())).ok() {
-            if let Some(window) = self
-                .space
-                .elements()
-                .find(|window| window.toplevel().is_some_and(|top| top.wl_surface() == &root))
-            {
+            if let Some(window) = self.space.elements().find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|top| top.wl_surface() == &root)
+            }) {
                 let output_geo = self
                     .output
                     .as_ref()
@@ -152,7 +189,12 @@ impl XdgShellHandler for State {
         self.mark_dirty();
     }
 
-    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
         surface.with_pending_state(|state| {
             state.geometry = positioner.get_geometry();
             state.positioner = positioner;
@@ -205,7 +247,10 @@ impl ClientDndGrabHandler for State {}
 impl ServerDndGrabHandler for State {}
 impl OutputHandler for State {}
 
-pub fn surface_at(state: &State, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+pub fn surface_at(
+    state: &State,
+    pos: Point<f64, Logical>,
+) -> Option<(WlSurface, Point<f64, Logical>)> {
     if state.page != Page::Browser {
         return None;
     }
@@ -217,6 +262,7 @@ pub fn surface_at(state: &State, pos: Point<f64, Logical>) -> Option<(WlSurface,
 
 smithay::delegate_compositor!(State);
 smithay::delegate_shm!(State);
+smithay::delegate_dmabuf!(State);
 smithay::delegate_xdg_shell!(State);
 smithay::delegate_seat!(State);
 smithay::delegate_data_device!(State);
