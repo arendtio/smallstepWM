@@ -9,4 +9,4 @@ What the shell should do, kept apart from how a particular version is built.
 
 A user story changes when the requirement changes. A proposal can be dropped without making a story wrong.
 
-The current package covers the shell, the left strip, the start view, Firefox pages in that strip, power controls, mouse-driven Wi-Fi, the voice toggle, the in-process tools, hardware OpenGL ES when a real EGL device is present, the Arch package, and the SDDM session.
+The current package covers the shell, the left strip, the start view, Firefox pages in that strip, power controls, mouse-driven Wi-Fi, the voice toggle, the in-process tools, OpenGL ES through the seat's GBM device, the Arch package, and the SDDM session.

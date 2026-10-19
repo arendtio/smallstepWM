@@ -12,7 +12,7 @@ use smithay::{
             gbm::{GbmFramebuffer, framebuffer_from_bo},
         },
         egl::{
-            EGLContext, EGLDevice, EGLDisplay,
+            EGLContext, EGLDisplay,
             context::{GlAttributes, PixelFormatRequirements},
         },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
@@ -42,6 +42,7 @@ use smithay::{
                 self, Device as ControlDevice, ModeTypeFlags, PageFlipFlags, connector, crtc,
                 dumbbuffer, framebuffer,
             },
+            node::NodeType,
         },
         input::{Device as InputDevice, Libinput},
         pixman,
@@ -49,7 +50,7 @@ use smithay::{
         wayland_server::Display,
     },
     utils::{DeviceFd, Logical, Point, Scale, Transform},
-    wayland::socket::ListeningSocketSource,
+    wayland::{dmabuf::DmabufFeedbackBuilder, socket::ListeningSocketSource},
 };
 
 pub(crate) struct ScanBuffer {
@@ -134,14 +135,6 @@ impl Gpu {
             Engine::Gl { buffers, .. } => buffers[index].handle,
         }
     }
-
-    fn replace_with_software(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let (width, height) = self.mode.size();
-        self.engine = software_engine(&self.fd, (u32::from(width), u32::from(height)))?;
-        self.displayed = None;
-        self.pending = None;
-        Ok(())
-    }
 }
 
 smithay::backend::renderer::element::render_elements! {
@@ -209,29 +202,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!(socket = ?state.socket_name, "session ready");
 
-    let accelerated = state.gpu.as_ref().is_some_and(|gpu| gpu.is_accelerated());
     if let Err(err) = pump(&mut state) {
-        if !accelerated {
-            return Err(err);
-        }
-        tracing::warn!(%err, "OpenGL ES frame failed, using software rendering");
-        fallback_to_software(&mut state)?;
-        pump(&mut state)?;
-    } else if accelerated
-        && state
-            .gpu
-            .as_ref()
-            .is_some_and(|gpu| gpu.displayed.is_none())
-    {
-        tracing::warn!("OpenGL ES did not show a frame, using software rendering");
-        fallback_to_software(&mut state)?;
-        pump(&mut state)?;
+        session_log(&format!("the first frame failed: {err}"));
+        return Err(err);
     }
     if state
         .gpu
         .as_ref()
         .is_some_and(|gpu| gpu.displayed.is_none())
     {
+        session_log("the first frame was not shown");
         return Err("the first frame was not shown".into());
     }
     event_loop.run(None, &mut state, |state| {
@@ -359,15 +339,12 @@ fn open_gpu(
     let (width, height) = picked.mode.size();
     let size = (u32::from(width), u32::from(height));
     let engine = if hardware_requested(std::env::var("SMALLSTEP_RENDERER").ok().as_deref()) {
-        match try_accelerated(&fd, size) {
-            Ok(engine) => engine,
-            Err(err) => {
-                tracing::warn!(reason = %err, "OpenGL ES unavailable, using software rendering");
-                software_engine(&fd, size)?
-            }
-        }
+        try_accelerated(&fd, size).map_err(|err| {
+            session_log(&err);
+            err
+        })?
     } else {
-        tracing::warn!("using software rendering");
+        session_log("using software rendering because SMALLSTEP_RENDERER requested it");
         software_engine(&fd, size)?
     };
     let damage = OutputDamageTracker::from_output(&output);
@@ -412,14 +389,18 @@ fn open_gpu(
     if gpu.is_accelerated() {
         let formats = gpu.dmabuf_formats();
         let count = formats.len();
-        if count > 0 {
-            state.dmabuf_global = Some(
-                state
-                    .dmabuf_state
-                    .create_global::<State>(&state.display_handle, formats),
-            );
-        }
-        tracing::warn!(dmabuf_formats = count, "using OpenGL ES");
+        let device = feedback_device(&gpu.fd)?;
+        let feedback = DmabufFeedbackBuilder::new(device, formats)
+            .build()
+            .map_err(|err| format!("dma-buf feedback: {err}"))?;
+        state.dmabuf_global = Some(
+            state
+                .dmabuf_state
+                .create_global_with_default_feedback::<State>(&state.display_handle, &feedback),
+        );
+        session_log(&format!(
+            "using OpenGL ES via GBM ({count} dma-buf formats)"
+        ));
     }
     Ok(gpu)
 }
@@ -961,20 +942,9 @@ fn restore_scanout(gpu: &mut Gpu) -> Result<(), String> {
         })
 }
 
-fn fallback_to_software(state: &mut State) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(global) = state.dmabuf_global.take() {
-        state
-            .dmabuf_state
-            .disable_global::<State>(&state.display_handle, &global);
-        state
-            .dmabuf_state
-            .destroy_global::<State>(&state.display_handle, global);
-    }
-    let gpu = state.gpu.as_mut().ok_or("no gpu")?;
-    gpu.replace_with_software()?;
-    state.dirty = true;
-    state.frame_pending = false;
-    Ok(())
+fn session_log(message: &str) {
+    eprintln!("smallstepwm: {message}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
 fn software_engine(
@@ -996,19 +966,26 @@ fn hardware_requested(value: Option<&str>) -> bool {
     )
 }
 
-fn same_gpu(seat_major: u32, seat_minor: u32, device_major: u32, device_minor: u32) -> bool {
-    seat_major == device_major && seat_minor % 64 == device_minor % 64
+fn feedback_device(fd: &DrmDeviceFd) -> Result<u64, String> {
+    let primary = DrmNode::from_file(fd).map_err(|err| err.to_string())?;
+    let node = primary
+        .node_with_type(NodeType::Render)
+        .and_then(Result::ok)
+        .unwrap_or(primary);
+    Ok(node.dev_id() as u64)
 }
 
 fn try_accelerated(fd: &DrmDeviceFd, size: (u32, u32)) -> Result<Engine, String> {
-    let seat = DrmNode::from_file(fd).map_err(|err| err.to_string())?;
-    let device = match_hardware_device(seat)?;
-    // The EGL device is a process-wide handle. Nothing else has made it current.
-    let display = unsafe { EGLDisplay::new(device) }.map_err(|err| err.to_string())?;
-    let context = egl_context(&display)?;
-    // This thread is still the only one, and the context is not current elsewhere.
-    let mut renderer = unsafe { GlesRenderer::new(context) }.map_err(|err| err.to_string())?;
-    let gbm = GbmDevice::new(fd.clone()).map_err(|err| err.to_string())?;
+    // The already-open primary node is the native GBM display.
+    let gbm = GbmDevice::new(fd.clone()).map_err(|err| format!("GBM device: {err}"))?;
+    let backend = gbm.backend_name().to_string();
+    // Smithay selects EGL_KHR_platform_gbm, then EGL_MESA_platform_gbm.
+    // The display keeps one GBM device; the allocator keeps the other clone.
+    let display =
+        unsafe { EGLDisplay::new(gbm.clone()) }.map_err(|err| format!("{err} ({err:?})"))?;
+    session_log(&format!("EGL display initialized on GBM backend {backend}"));
+    // This thread is still the only one. A failed renderer is not replaced by pixman.
+    let mut renderer = gles_renderer(&display)?;
     let mut allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
     let mut last = String::from("no scanout format");
     for fourcc in [Fourcc::Argb8888, Fourcc::Xrgb8888] {
@@ -1035,43 +1012,37 @@ fn try_accelerated(fd: &DrmDeviceFd, size: (u32, u32)) -> Result<Engine, String>
     Err(last)
 }
 
-fn match_hardware_device(seat: DrmNode) -> Result<EGLDevice, String> {
-    let devices = EGLDevice::enumerate().map_err(|err| err.to_string())?;
-    for device in devices {
-        if device.is_software() {
-            continue;
-        }
-        let Ok(Some(node)) = device.try_get_render_node() else {
-            continue;
-        };
-        if same_gpu(seat.major(), seat.minor(), node.major(), node.minor()) {
-            return Ok(device);
-        }
-    }
-    Err("no hardware EGL device for this seat".into())
-}
-
-fn egl_context(display: &EGLDisplay) -> Result<EGLContext, String> {
-    let reqs = PixelFormatRequirements {
-        hardware_accelerated: Some(true),
-        color_bits: Some(24),
-        float_color_buffer: false,
-        alpha_bits: None,
-        depth_bits: None,
-        stencil_bits: None,
-        multisampling: None,
-    };
+fn gles_renderer(display: &EGLDisplay) -> Result<GlesRenderer, String> {
     let mut last = String::from("no GLES context");
-    for major in [3, 2] {
-        let attributes = GlAttributes {
-            version: (major, 0),
-            profile: None,
-            debug: false,
-            vsync: false,
-        };
-        match EGLContext::new_with_config(display, attributes, reqs) {
-            Ok(context) => return Ok(context),
-            Err(err) => last = err.to_string(),
+    // A slow config is still this seat's GLES driver. Do not require CONFIG_CAVEAT NONE.
+    for color_bits in [Some(24), None] {
+        for major in [3, 2] {
+            let reqs = PixelFormatRequirements {
+                hardware_accelerated: None,
+                color_bits,
+                float_color_buffer: false,
+                alpha_bits: None,
+                depth_bits: None,
+                stencil_bits: None,
+                multisampling: None,
+            };
+            let attributes = GlAttributes {
+                version: (major, 0),
+                profile: None,
+                debug: false,
+                vsync: false,
+            };
+            let context = match EGLContext::new_with_config(display, attributes, reqs) {
+                Ok(context) => context,
+                Err(err) => {
+                    last = format!("GLES {major}.0: {err} ({err:?})");
+                    continue;
+                }
+            };
+            match unsafe { GlesRenderer::new(context) } {
+                Ok(renderer) => return Ok(renderer),
+                Err(err) => last = format!("GLES {major}.0 renderer: {err} ({err:?})"),
+            }
         }
     }
     Err(last)
@@ -1296,7 +1267,7 @@ fn wl_mode(mode: &control::Mode) -> Mode {
 
 #[cfg(test)]
 mod tests {
-    use super::{hardware_requested, same_gpu};
+    use super::hardware_requested;
 
     #[test]
     fn software_names_force_the_cpu_path() {
@@ -1313,13 +1284,5 @@ mod tests {
         assert!(hardware_requested(Some("auto")));
         assert!(hardware_requested(Some("gl")));
         assert!(hardware_requested(Some("egl")));
-    }
-
-    #[test]
-    fn primary_and_render_node_are_the_same_gpu() {
-        assert!(same_gpu(226, 0, 226, 128));
-        assert!(same_gpu(226, 1, 226, 129));
-        assert!(!same_gpu(226, 0, 226, 129));
-        assert!(!same_gpu(226, 0, 226, 1));
     }
 }
