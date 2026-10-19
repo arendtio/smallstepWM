@@ -393,6 +393,7 @@ impl State {
                 if generation != self.pages_generation {
                     return;
                 }
+                tracing::warn!(%note, "page list stopped");
                 self.pages.clear();
                 self.active_context = None;
                 self.pages_cmd = None;

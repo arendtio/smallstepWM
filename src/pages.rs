@@ -13,7 +13,7 @@ use std::{
 };
 
 use futures_util::{Sink, SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use smithay::reexports::calloop::channel::Sender;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -81,7 +81,10 @@ pub fn ensure_profile(dir: &Path) -> std::io::Result<()> {
 }
 
 pub fn launch_args(profile: &Path, already_running: bool) -> Vec<std::ffi::OsString> {
-    let mut args = vec![std::ffi::OsString::from("-profile"), profile.as_os_str().to_os_string()];
+    let mut args = vec![
+        std::ffi::OsString::from("-profile"),
+        profile.as_os_str().to_os_string(),
+    ];
     if already_running {
         args.push("--new-window".into());
     } else {
@@ -97,7 +100,11 @@ pub fn label(title: &str, url: &str) -> String {
     let generic = title.is_empty()
         || title.eq_ignore_ascii_case("mozilla firefox")
         || title.eq_ignore_ascii_case("about:blank");
-    let source = if generic { host_label(url) } else { title.to_string() };
+    let source = if generic {
+        host_label(url)
+    } else {
+        title.to_string()
+    };
     truncate_label(&source, 18)
 }
 
@@ -108,7 +115,11 @@ fn host_label(url: &str) -> String {
     let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let host = host.trim_start_matches("www.");
-    if host.is_empty() { "Page".into() } else { host.to_string() }
+    if host.is_empty() {
+        "Page".into()
+    } else {
+        host.to_string()
+    }
 }
 
 fn truncate_label(text: &str, limit: usize) -> String {
@@ -126,7 +137,8 @@ pub fn normalize_url(raw: &str) -> Result<String, &'static str> {
         return Err("missing url");
     }
     let lower = raw.to_ascii_lowercase();
-    if lower.starts_with("javascript:") || lower.starts_with("data:") || lower.starts_with("file:") {
+    if lower.starts_with("javascript:") || lower.starts_with("data:") || lower.starts_with("file:")
+    {
         return Err("unsupported url");
     }
     if lower.starts_with("http://") || lower.starts_with("https://") {
@@ -150,7 +162,9 @@ pub fn pick(pages: &[Page], query: &str) -> Option<usize> {
     }
     let query = query.to_ascii_lowercase();
     pages.iter().position(|page| {
-        label(&page.title, &page.url).to_ascii_lowercase().contains(&query)
+        label(&page.title, &page.url)
+            .to_ascii_lowercase()
+            .contains(&query)
             || page.url.to_ascii_lowercase().contains(&query)
     })
 }
@@ -165,7 +179,11 @@ pub fn apply_event(book: &mut Book, method: &str, params: &Value) -> bool {
             if params.get("parent").and_then(Value::as_str).is_some() {
                 return false;
             }
-            let url = params.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+            let url = params
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let existed = book.pages.iter().any(|page| page.context == context);
             let changed = upsert(book, context, url);
             if !existed {
@@ -190,10 +208,15 @@ pub fn apply_event(book: &mut Book, method: &str, params: &Value) -> bool {
                 .get("url")
                 .and_then(Value::as_str)
                 .is_some_and(|url| set_url(book, context, url));
-            let retry_title = matches!(method, "browsingContext.domContentLoaded" | "browsingContext.load")
-                && book.pages.iter().any(|page| {
-                    page.context == context && page.title.is_empty() && !page.url.is_empty() && page.url != "about:blank"
-                });
+            let retry_title = matches!(
+                method,
+                "browsingContext.domContentLoaded" | "browsingContext.load"
+            ) && book.pages.iter().any(|page| {
+                page.context == context
+                    && page.title.is_empty()
+                    && !page.url.is_empty()
+                    && page.url != "about:blank"
+            });
             changed || retry_title
         }
         _ => false,
@@ -209,7 +232,11 @@ fn upsert(book: &mut Book, context: &str, url: String) -> bool {
         page.title.clear();
         return true;
     }
-    book.pages.push(Page { context: context.to_string(), url, title: String::new() });
+    book.pages.push(Page {
+        context: context.to_string(),
+        url,
+        title: String::new(),
+    });
     true
 }
 
@@ -237,16 +264,28 @@ pub fn replace_tree(book: &mut Book, contexts: &Value) {
         let Some(context) = node.get("context").and_then(Value::as_str) else {
             continue;
         };
-        let url = node.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+        let url = node
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let title = book
             .pages
             .iter()
             .find(|page| page.context == context)
             .map(|page| page.title.clone())
             .unwrap_or_default();
-        pages.push(Page { context: context.to_string(), url, title });
+        pages.push(Page {
+            context: context.to_string(),
+            url,
+            title,
+        });
     }
-    if book.active.as_ref().is_some_and(|id| !pages.iter().any(|page| &page.context == id)) {
+    if book
+        .active
+        .as_ref()
+        .is_some_and(|id| !pages.iter().any(|page| &page.context == id))
+    {
         book.active = None;
     }
     if book.active.is_none() {
@@ -260,7 +299,12 @@ pub fn title_from_evaluate(result: &Value) -> Option<String> {
     if value.get("type").and_then(Value::as_str) != Some("string") {
         return None;
     }
-    value.get("value").and_then(Value::as_str).map(str::trim).map(str::to_string).filter(|title| !title.is_empty())
+    value
+        .get("value")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_string)
+        .filter(|title| !title.is_empty())
 }
 
 pub fn websocket_url_from_body(body: &str) -> Option<String> {
@@ -274,6 +318,13 @@ pub fn websocket_url_from_body(body: &str) -> Option<String> {
     }
 }
 
+/// Current Firefox speaks WebDriver BiDi on this socket. `/json/version` was the
+/// Chrome DevTools discovery page and is gone, so a missing URL still has a target.
+pub fn debugger_target(port: u16, version_body: &str) -> String {
+    websocket_url_from_body(version_body)
+        .unwrap_or_else(|| format!("ws://127.0.0.1:{port}/session"))
+}
+
 pub fn panic_note(payload: &(dyn std::any::Any + Send)) -> String {
     let detail = payload
         .downcast_ref::<&str>()
@@ -282,10 +333,18 @@ pub fn panic_note(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_default();
     let detail: String = detail.split_whitespace().collect::<Vec<_>>().join(" ");
     let detail: String = detail.chars().take(80).collect();
-    if detail.is_empty() { "Page list stopped".into() } else { format!("Page list stopped: {detail}") }
+    if detail.is_empty() {
+        "Page list stopped".into()
+    } else {
+        format!("Page list stopped: {detail}")
+    }
 }
 
-pub fn run(cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, report_tx: Sender<Report>, generation: u64) -> Result<(), String> {
+pub fn run(
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    report_tx: Sender<Report>,
+    generation: u64,
+) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -307,7 +366,13 @@ async fn drive(
             return Err(err);
         }
     };
-    let (socket, _) = connect_async(url.as_str()).await.map_err(|err| clip(&err.to_string()))?;
+    let socket = match connect_debugger(&url).await {
+        Ok(socket) => socket,
+        Err(err) => {
+            fail_open(&mut queued, &err);
+            return Err(err);
+        }
+    };
     let (mut write, mut read) = socket.split();
     let mut book = Book::default();
     let mut next_id = 1u64;
@@ -315,7 +380,13 @@ async fn drive(
     let mut opening: HashMap<u64, (String, tokio::sync::oneshot::Sender<String>)> = HashMap::new();
     let mut ready = false;
     let session_id = fresh_id(&mut next_id);
-    send(&mut write, session_id, "session.new", json!({"capabilities": {}})).await?;
+    send(
+        &mut write,
+        session_id,
+        "session.new",
+        json!({"capabilities": {}}),
+    )
+    .await?;
     let mut tree_id = 0u64;
 
     loop {
@@ -451,13 +522,41 @@ async fn wait_for_debugger(
 fn debugger_url(port: u16) -> Option<String> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(400)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(400))).ok()?;
     stream
-        .write_all(b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .set_read_timeout(Some(Duration::from_millis(400)))
         .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(400)))
+        .ok()?;
+    let _ = stream
+        .write_all(b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    websocket_url_from_body(&body)
+    let _ = stream.read_to_string(&mut body);
+    Some(debugger_target(port, &body))
+}
+
+async fn connect_debugger(
+    url: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match connect_async(url).await {
+            Ok((socket, _)) => return Ok(socket),
+            Err(err) => {
+                let note = clip(&err.to_string());
+                if Instant::now() >= deadline {
+                    return Err(note);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if Instant::now() >= deadline {
+                    return Err(note);
+                }
+            }
+        }
+    }
 }
 
 fn fresh_id(next: &mut u64) -> u64 {
@@ -472,7 +571,10 @@ where
     S::Error: std::fmt::Display,
 {
     let text = json!({"id": id, "method": method, "params": params}).to_string();
-    write.send(Message::Text(text.into())).await.map_err(|err| clip(&err.to_string()))
+    write
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(|err| clip(&err.to_string()))
 }
 
 async fn request_missing_titles<S>(
@@ -536,7 +638,13 @@ where
                 publish(report_tx, generation, book);
             }
             let id = fresh_id(next_id);
-            send(write, id, "browsingContext.activate", json!({"context": context})).await?;
+            send(
+                write,
+                id,
+                "browsingContext.activate",
+                json!({"context": context}),
+            )
+            .await?;
         }
         Command::Open { url, reply } => {
             let id = fresh_id(next_id);
@@ -563,14 +671,22 @@ fn fail_open(queued: &mut Vec<Command>, note: &str) {
     }
 }
 
-fn fail_open_map(opening: &mut HashMap<u64, (String, tokio::sync::oneshot::Sender<String>)>, note: &str) {
+fn fail_open_map(
+    opening: &mut HashMap<u64, (String, tokio::sync::oneshot::Sender<String>)>,
+    note: &str,
+) {
     for (_, (_, reply)) in opening.drain() {
         let _ = reply.send(note.to_string());
     }
 }
 
 fn clip(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect()
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect()
 }
 
 #[cfg(test)]
@@ -615,19 +731,40 @@ mod tests {
             ]),
         );
         assert_eq!(book.pages.len(), 2);
-        assert!(title_from_evaluate(&json!({"result": {"type": "string", "value": "Example"}})).as_deref() == Some("Example"));
-        apply_event(&mut book, "browsingContext.contextDestroyed", &json!({"context": "second"}));
+        assert!(
+            title_from_evaluate(&json!({"result": {"type": "string", "value": "Example"}}))
+                .as_deref()
+                == Some("Example")
+        );
+        apply_event(
+            &mut book,
+            "browsingContext.contextDestroyed",
+            &json!({"context": "second"}),
+        );
         assert_eq!(book.active.as_deref(), Some("tab"));
     }
 
     #[test]
     fn labels_urls_and_launch_args() {
-        assert_eq!(label("Mozilla Firefox", "https://www.example.com/a"), "example.com");
-        assert_eq!(label("Ein Titel mit Umlaut ä", "https://example.com/"), "Ein Titel mit U...");
-        assert_eq!(normalize_url("example.com/path").as_deref(), Ok("https://example.com/path"));
+        assert_eq!(
+            label("Mozilla Firefox", "https://www.example.com/a"),
+            "example.com"
+        );
+        assert_eq!(
+            label("Ein Titel mit Umlaut ä", "https://example.com/"),
+            "Ein Titel mit U..."
+        );
+        assert_eq!(
+            normalize_url("example.com/path").as_deref(),
+            Ok("https://example.com/path")
+        );
         assert!(normalize_url("javascript:alert(1)").is_err());
         assert!(normalize_url("file:///etc/passwd").is_err());
-        let pages = vec![Page { context: "a".into(), url: "https://en.wikipedia.org/".into(), title: "Wikipedia".into() }];
+        let pages = vec![Page {
+            context: "a".into(),
+            url: "https://en.wikipedia.org/".into(),
+            title: "Wikipedia".into(),
+        }];
         assert_eq!(pick(&pages, "1"), Some(0));
         assert_eq!(pick(&pages, "wiki"), Some(0));
         assert_eq!(pick(&pages, "missing"), None);
@@ -638,9 +775,28 @@ mod tests {
         let again = launch_args(profile, true);
         assert!(again.iter().any(|arg| arg == "--new-window"));
         assert!(!again.iter().any(|arg| arg == "--remote-debugging-port"));
-        let body = "HTTP/1.1 200 OK\r\n\r\n{\"webSocketDebuggerUrl\":\"ws://127.0.0.1:47321/session\"}";
-        assert_eq!(websocket_url_from_body(body).as_deref(), Some("ws://127.0.0.1:47321/session"));
-        assert!(websocket_url_from_body("{\"webSocketDebuggerUrl\":\"ws://example.com/session\"}").is_none());
+        let body =
+            "HTTP/1.1 200 OK\r\n\r\n{\"webSocketDebuggerUrl\":\"ws://127.0.0.1:47321/session\"}";
+        assert_eq!(
+            websocket_url_from_body(body).as_deref(),
+            Some("ws://127.0.0.1:47321/session")
+        );
+        assert!(
+            websocket_url_from_body("{\"webSocketDebuggerUrl\":\"ws://example.com/session\"}")
+                .is_none()
+        );
+        assert_eq!(
+            debugger_target(47321, "HTTP/1.1 404 Not Found\r\n\r\nNot found"),
+            "ws://127.0.0.1:47321/session"
+        );
+        assert_eq!(debugger_target(47321, body), "ws://127.0.0.1:47321/session");
+        assert_eq!(
+            debugger_target(
+                47321,
+                "HTTP/1.1 200 OK\r\n\r\n{\"webSocketDebuggerUrl\":\"ws://localhost:47321/devtools/browser/abc\"}"
+            ),
+            "ws://localhost:47321/devtools/browser/abc"
+        );
         assert!(user_chrome_css().contains("#TabsToolbar"));
         let dir = std::env::temp_dir().join(format!("smallstep-profile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
