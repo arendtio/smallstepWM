@@ -1,0 +1,35 @@
+[package]
+name = "smallstepwm"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "A small Wayland shell"
+publish = false
+
+[dependencies]
+base64 = "0.23.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = "1.0.154"
+smithay = { version = "0.6", default-features = false, features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_gbm_has_create_with_modifiers2",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "desktop",
+    "renderer_gl",
+    "renderer_pixman",
+    "wayland_frontend",
+] }
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "time", "sync", "macros", "io-util", "net"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true

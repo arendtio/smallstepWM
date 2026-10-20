@@ -1,0 +1,17 @@
+// This shell has no polkit agent, so a password prompt never appears.
+// A person logged in locally may power off and reboot, including when
+// another session is open or a program is inhibiting shutdown.
+// Remote sessions are left to the default policy.
+polkit.addRule(function(action, subject) {
+    if (!subject.local) {
+        return;
+    }
+    if (action.id == "org.freedesktop.login1.power-off" ||
+        action.id == "org.freedesktop.login1.power-off-multiple-sessions" ||
+        action.id == "org.freedesktop.login1.power-off-ignore-inhibit" ||
+        action.id == "org.freedesktop.login1.reboot" ||
+        action.id == "org.freedesktop.login1.reboot-multiple-sessions" ||
+        action.id == "org.freedesktop.login1.reboot-ignore-inhibit") {
+        return polkit.Result.YES;
+    }
+});
