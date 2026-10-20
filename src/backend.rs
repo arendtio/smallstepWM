@@ -996,6 +996,7 @@ fn damage_covers_output(damage: &[Rectangle<i32, Physical>], width: i32, height:
             .any(|rect| rect.size.w >= width && rect.size.h >= height)
 }
 
+#[cfg(test)]
 fn ages_for_slots(slots: usize, frames: usize) -> Vec<usize> {
     let mut now = 0u64;
     let mut rendered = vec![None; slots];
