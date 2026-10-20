@@ -49,7 +49,7 @@ use smithay::{
         rustix::fs::OFlags,
         wayland_server::Display,
     },
-    utils::{DeviceFd, Logical, Point, Scale, Transform},
+    utils::{DeviceFd, Logical, Physical, Point, Rectangle, Scale, Transform},
     wayland::{dmabuf::DmabufFeedbackBuilder, socket::ListeningSocketSource},
 };
 
@@ -101,6 +101,12 @@ pub struct Gpu {
     pub mode: control::Mode,
     pub displayed: Option<usize>,
     pub pending: Option<usize>,
+    /// Next frame number. A successful draw stores it on that slot, then advances it.
+    frame: u64,
+    /// Frame stored in each scanout slot. Empty means the slot has never been drawn.
+    slot_frame: Vec<Option<u64>>,
+    /// One acceptance line, after the first frame that can reuse a slot.
+    age_logged: bool,
 }
 
 impl Gpu {
@@ -287,6 +293,8 @@ fn open_gpu(
                         tracing::error!(?err, "drm resume");
                     }
                     gpu.pending = None;
+                    // The displayed buffers are not reusable across a session pause.
+                    gpu.slot_frame.fill(None);
                     if let Err(err) = restore_scanout(gpu) {
                         tracing::error!(?err, "restore scanout");
                     }
@@ -360,6 +368,10 @@ fn open_gpu(
         0,
     );
     let (cursor, cursor_hot) = cursor_buffer();
+    let slots = match &engine {
+        Engine::Soft { buffers, .. } => buffers.len(),
+        Engine::Gl { buffers, .. } => buffers.len(),
+    };
     let gpu = Gpu {
         engine,
         drm,
@@ -385,6 +397,9 @@ fn open_gpu(
         mode: picked.mode,
         displayed: None,
         pending: None,
+        frame: 0,
+        slot_frame: vec![None; slots],
+        age_logged: false,
     };
     if gpu.is_accelerated() {
         let formats = gpu.dmabuf_formats();
@@ -607,8 +622,24 @@ fn draw(state: &mut State) -> Result<bool, Box<dyn std::error::Error>> {
         .displayed
         .map(|shown| (shown + 1) % gpu.buffer_count())
         .unwrap_or(0);
+    let (mode_w, mode_h) = gpu.mode.size();
+    let output = (i32::from(mode_w), i32::from(mode_h));
+    let age = buffer_age(gpu.frame, gpu.slot_frame.get(index).copied().flatten());
     // Front to back: cursor, strip, Wi-Fi panel, power menu, startup bar, window, then the gradient.
-    render_into(gpu, index, &decor)?;
+    let paint = render_into(gpu, index, &decor, age, output)?;
+    if !paint.drew {
+        return Ok(false);
+    }
+    gpu.slot_frame[index] = Some(gpu.frame);
+    gpu.frame = gpu.frame.saturating_add(1);
+    if !gpu.age_logged && age > 0 {
+        let coverage = if paint.full { "full" } else { "partial" };
+        session_log(&format!(
+            "buffer age {age}, {coverage} damage on {}x{}: {}",
+            output.0, output.1, paint.rects
+        ));
+        gpu.age_logged = true;
+    }
     present(gpu, index)
 }
 
@@ -616,7 +647,9 @@ fn render_into(
     gpu: &mut Gpu,
     index: usize,
     decor: &Decor,
-) -> Result<(), Box<dyn std::error::Error>> {
+    age: usize,
+    output: (i32, i32),
+) -> Result<FramePaint, Box<dyn std::error::Error>> {
     let Gpu {
         engine,
         damage,
@@ -639,7 +672,15 @@ fn render_into(
                 power_menu,
                 decor,
             )?;
-            paint_soft(renderer, damage, fd, &mut buffers[index], &elements)?;
+            paint_soft(
+                renderer,
+                damage,
+                fd,
+                &mut buffers[index],
+                &elements,
+                age,
+                output,
+            )
         }
         Engine::Gl {
             renderer, buffers, ..
@@ -653,10 +694,9 @@ fn render_into(
                 power_menu,
                 decor,
             )?;
-            paint_gl(renderer, damage, &buffers[index], &elements)?;
+            paint_gl(renderer, damage, &buffers[index], &elements, age, output)
         }
     }
-    Ok(())
 }
 
 struct Decor {
@@ -829,7 +869,9 @@ fn paint_soft(
     fd: &DrmDeviceFd,
     buffer: &mut ScanBuffer,
     elements: &[ShellElement<PixmanRenderer>],
-) -> Result<(), Box<dyn std::error::Error>> {
+    age: usize,
+    output: (i32, i32),
+) -> Result<FramePaint, Box<dyn std::error::Error>> {
     let (width, height) = DrmBuffer::size(&buffer.dumb);
     let pitch = DrmBuffer::pitch(&buffer.dumb) as usize;
     let mut mapping = fd.map_dumb_buffer(&mut buffer.dumb).map_err(|err| {
@@ -853,19 +895,20 @@ fn paint_soft(
     }
     .map_err(|_| "creating the scanout image failed")?;
     let mut target = renderer.bind(&mut image).map_err(|err| err.to_string())?;
-    damage
+    let rendered = damage
         .render_output(
             renderer,
             &mut target,
-            0,
+            age,
             elements,
             Color32F::new(0.08, 0.09, 0.11, 1.0),
         )
         .map_err(|err| err.to_string())?;
+    let paint = describe_damage(rendered.damage, output.0, output.1);
     drop(target);
     drop(image);
     drop(mapping);
-    Ok(())
+    Ok(paint)
 }
 
 fn paint_gl(
@@ -873,24 +916,98 @@ fn paint_gl(
     damage: &mut OutputDamageTracker,
     buffer: &GlScan,
     elements: &[ShellElement<GlesRenderer>],
-) -> Result<(), Box<dyn std::error::Error>> {
+    age: usize,
+    output: (i32, i32),
+) -> Result<FramePaint, Box<dyn std::error::Error>> {
     let mut dmabuf = buffer.dmabuf.clone();
     let mut target = renderer.bind(&mut dmabuf).map_err(|err| err.to_string())?;
-    damage
+    let rendered = damage
         .render_output(
             renderer,
             &mut target,
-            0,
+            age,
             elements,
             Color32F::new(0.08, 0.09, 0.11, 1.0),
         )
         .map_err(|err| err.to_string())?;
+    let paint = describe_damage(rendered.damage, output.0, output.1);
     drop(target);
     // The scanout buffer is a dma-buf. Finish so the display does not read it mid-draw.
-    renderer
-        .with_context(|gl| unsafe { gl.Finish() })
-        .map_err(|err| err.to_string())?;
-    Ok(())
+    if paint.drew {
+        renderer
+            .with_context(|gl| unsafe { gl.Finish() })
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(paint)
+}
+
+struct FramePaint {
+    drew: bool,
+    full: bool,
+    rects: String,
+}
+
+fn describe_damage(
+    damage: Option<&Vec<Rectangle<i32, Physical>>>,
+    width: i32,
+    height: i32,
+) -> FramePaint {
+    let Some(damage) = damage else {
+        return FramePaint {
+            drew: false,
+            full: false,
+            rects: String::new(),
+        };
+    };
+    let shown = damage.len().min(6);
+    let mut rects = damage
+        .iter()
+        .take(shown)
+        .map(|rect| {
+            format!(
+                "{},{} {}x{}",
+                rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if damage.len() > shown {
+        rects.push_str(&format!("; +{}", damage.len() - shown));
+    }
+    FramePaint {
+        drew: true,
+        full: damage_covers_output(damage, width, height),
+        rects,
+    }
+}
+
+fn buffer_age(now: u64, rendered_at: Option<u64>) -> usize {
+    match rendered_at {
+        Some(then) => usize::try_from(now.saturating_sub(then)).unwrap_or(usize::MAX),
+        None => 0,
+    }
+}
+
+fn damage_covers_output(damage: &[Rectangle<i32, Physical>], width: i32, height: i32) -> bool {
+    width > 0
+        && height > 0
+        && damage
+            .iter()
+            .any(|rect| rect.size.w >= width && rect.size.h >= height)
+}
+
+fn ages_for_slots(slots: usize, frames: usize) -> Vec<usize> {
+    let mut now = 0u64;
+    let mut rendered = vec![None; slots];
+    let mut ages = Vec::with_capacity(frames);
+    for frame in 0..frames {
+        let index = frame % slots;
+        let age = buffer_age(now, rendered[index]);
+        ages.push(age);
+        rendered[index] = Some(now);
+        now += 1;
+    }
+    ages
 }
 
 fn present(gpu: &mut Gpu, index: usize) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1267,7 +1384,8 @@ fn wl_mode(mode: &control::Mode) -> Mode {
 
 #[cfg(test)]
 mod tests {
-    use super::hardware_requested;
+    use super::{ages_for_slots, buffer_age, damage_covers_output, hardware_requested};
+    use smithay::utils::{Physical, Rectangle};
 
     #[test]
     fn software_names_force_the_cpu_path() {
@@ -1284,5 +1402,33 @@ mod tests {
         assert!(hardware_requested(Some("auto")));
         assert!(hardware_requested(Some("gl")));
         assert!(hardware_requested(Some("egl")));
+    }
+
+    #[test]
+    fn a_new_slot_redraws_the_whole_output() {
+        assert_eq!(buffer_age(0, None), 0);
+        assert_eq!(buffer_age(4, None), 0);
+    }
+
+    #[test]
+    fn age_is_the_frames_since_that_slot_was_drawn() {
+        assert_eq!(buffer_age(2, Some(0)), 2);
+        assert_eq!(buffer_age(3, Some(1)), 2);
+        assert_eq!(buffer_age(1, Some(0)), 1);
+    }
+
+    #[test]
+    fn two_slots_are_full_twice_then_reuse_the_previous_frame() {
+        assert_eq!(ages_for_slots(2, 6), vec![0, 0, 2, 2, 2, 2]);
+        assert_eq!(ages_for_slots(1, 4), vec![0, 1, 1, 1]);
+    }
+
+    #[test]
+    fn a_cursor_rectangle_does_not_cover_the_output() {
+        let cursor = Rectangle::<i32, Physical>::new((10, 20).into(), (32, 32).into());
+        let moved = Rectangle::<i32, Physical>::new((18, 24).into(), (32, 32).into());
+        assert!(!damage_covers_output(&[cursor, moved], 1024, 600));
+        let output = Rectangle::<i32, Physical>::from_size((1024, 600).into());
+        assert!(damage_covers_output(&[output], 1024, 600));
     }
 }
